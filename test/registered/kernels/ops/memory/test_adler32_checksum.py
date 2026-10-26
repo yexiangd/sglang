@@ -6,9 +6,10 @@ import zlib
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _ref_adler32(tensor: torch.Tensor) -> int:
@@ -83,6 +84,23 @@ class TestAdler32(unittest.TestCase):
         self._check_strided(
             [first, second], [idx, idx], [first.numel(), second.numel()]
         )
+
+    def test_strided_on_side_stream(self):
+        # The PD scheduler checksums on its schedule stream, not the default one.
+        # Both launches must follow the caller's current stream, or they race
+        # the producer of the data and the host read of the result.
+        stream = torch.cuda.Stream()
+        num_items = 1024
+        for _ in range(8):
+            with torch.cuda.stream(stream):
+                t = torch.randint(
+                    0, 256, (64 * 1024 * 1024,), dtype=torch.uint8, device="cuda"
+                )
+                idx = torch.arange(num_items, dtype=torch.int64, device="cuda")
+                stride = t.numel() // num_items
+                actual = adler32_strided_checksum([t.data_ptr()], [stride], [idx])
+                expected = _ref_strided_adler32([t], [idx], [stride])
+            self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

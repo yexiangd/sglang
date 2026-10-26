@@ -213,12 +213,10 @@ struct Adler32StridedKernel {
     uint32_t* out_b = out_a + num_blocks;
     uint64_t* out_len = reinterpret_cast<uint64_t*>(out_b + num_blocks);
 
-    DLDevice device;
-    device.device_type = kDLCUDA;
-    device.device_id = ptrs.device().device_id;
-
+    // Resolve the stream from the tensor's own device type: a hard-coded kDLCUDA
+    // misses the caller's stream on ROCm (kDLROCM) and launches on the null stream.
     size_t smem_bytes = (kBlockSize / 32) * sizeof(Adler32State);
-    LaunchKernel(num_blocks, kBlockSize, device, smem_bytes)(
+    LaunchKernel(num_blocks, kBlockSize, ptrs.device(), smem_bytes)(
         adler32_strided_kernel, ptrs_ptr, lens_ptr, out_a, out_b, out_len, num_items);
   }
 };
@@ -277,12 +275,8 @@ struct Adler32ReduceKernel {
     threads = t;
     if (threads > kBlockSize) threads = kBlockSize;
 
-    DLDevice device;
-    device.device_type = kDLCUDA;
-    device.device_id = states.device().device_id;
-
     size_t smem_bytes = ((threads + 31) / 32) * sizeof(Adler32State);
-    LaunchKernel(1, threads, device, smem_bytes)(
+    LaunchKernel(1, threads, states.device(), smem_bytes)(
         adler32_reduce_kernel, in_a, in_b, in_len, out_ptr, num_blocks_to_reduce);
   }
 };
