@@ -19,13 +19,12 @@ backend, it moves no data and sends no STATUS.
 
 With SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE, prefill answers an ABORT
 with the common [ABORT_ACK, room, prefill rank] frame once every put queued for
-the room before the ABORT has returned, and withholds the ack if a failed put's
-connection did not shut down cleanly. A decode transfer queue that honors the
-flag holds the aborted request's pages until that ack or its deferred-release
-timeout; one that does not releases them on Failed. A put that fails or times
-out shuts its connection down before prefill reports Failed or acks, because
-decode releases the pages as soon as it sees either; only the RDMA tier's
-shutdown waits for in-flight puts (see DESIGN.md).
+the room before the ABORT has returned. A room with a failed or timed-out put
+is never acked, as with a failed Mori or NIXL write: only the RDMA tier's
+shutdown waits for in-flight puts, so decode keeps the pages until its
+deferred-release timeout. A decode transfer queue that does not honor the flag
+releases the pages on Failed, so a failed put still shuts its connection down
+before prefill reports Failed (see DESIGN.md).
 
 Scope is intentionally narrow: CP=1, PP=1, DCP=1, no hisparse or custom memory
 pool, one-to-one prefill/decode rank routing (MLA dummy ranks included), and
@@ -43,14 +42,18 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
-from typing import Any, NoReturn
+from typing import Any
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
-import zmq
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     AckTarget,
     CommonKVBootstrapServer,
@@ -84,11 +87,7 @@ NO_AUX_INDEX = -1
 MAX_ACCEPTED_CONNECTIONS = 1024
 # A late abort for a cleared room is never consumed, so the oldest are evicted.
 MAX_PENDING_ABORTS = 4096
-# A room whose shutdown after a failed put raised may never be aborted,
-# so the oldest are evicted.
-MAX_FAILED_SHUTDOWN_ROOMS = 4096
 DEFAULT_ABORT_REASON = "UniFlow request aborted"
-UNKNOWN_FAILURE_REASON = "Failed due to an unknown reason from another rank"
 SUPPORTED_STATE_TYPES = frozenset({StateType.MAMBA, StateType.SWA, StateType.DSA})
 # Paged state that tolerates an index-count drift, as in the Mooncake backend.
 TRUNCATABLE_STATE_TYPES = frozenset({StateType.SWA, StateType.DSA})
@@ -199,6 +198,7 @@ class UniflowKVManager(CommonKVManager):
     kv_status_msg_carries_reason = True
     # The ABORT handler queues the ack behind every put already queued for the room.
     supports_deferred_decode_kv_release = True
+    reports_transfer_latency = True
 
     def __init__(
         self,
@@ -304,9 +304,6 @@ class UniflowKVManager(CommonKVManager):
         # Decode aborts (room -> reason) for rooms with no status. The sender's
         # __init__ consumes early ones; ones arriving after clear() age out.
         self.pending_aborts: OrderedDict[int, str] = OrderedDict()
-        # Rooms whose shutdown after a failed put raised;
-        # their ABORT_ACK is withheld. Only the transfer worker touches it.
-        self._failed_shutdown_rooms: OrderedDict[int, None] = OrderedDict()
         self.transfer_timeout_ms = transfer_timeout_ms
         self._accepted_connections: deque[Any] = deque(maxlen=MAX_ACCEPTED_CONNECTIONS)
         self._accepted_connections_lock = threading.Lock()
@@ -498,7 +495,7 @@ class UniflowKVManager(CommonKVManager):
                 )
                 self._transfer_queue.put(
                     functools.partial(
-                        self._send_abort_ack_unless_shutdown_failed, room, target
+                        self._send_abort_ack_unless_poisoned, room, target
                     )
                 )
             return
@@ -550,6 +547,55 @@ class UniflowKVManager(CommonKVManager):
             prefill_rank=prefill_rank,
             failure_reason=failure_reason,
         )
+
+    def build_receiver_registration_message(self) -> list[bytes]:
+        payload = json.dumps(
+            {
+                "agent_id": self.agent_id,
+                "kv_export_ids": self.kv_export_ids,
+                "aux_export_ids": self.aux_export_ids,
+                "state_export_ids": self.state_export_ids,
+            }
+        ).encode("utf-8")
+        return [GUARD, REGISTER_MSG, payload]
+
+    def build_receiver_metadata_message(
+        self,
+        *,
+        bootstrap_room: int,
+        required_dst_info_num: int,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: int | None,
+        state_indices: list | None,
+        decode_prefix_len: int | None,
+        is_dummy: bool,
+        device_kv_indices: npt.NDArray[np.int32] | None = None,
+    ) -> list[bytes]:
+        # One-to-one routing: the receiver rejects required_dst_info_num != 1.
+        if is_dummy:
+            kv_frame = aux_frame = state_frame = b""
+        else:
+            kv_frame = np.ascontiguousarray(kv_indices, dtype=np.int32).tobytes()
+            aux_frame = str(NO_AUX_INDEX if aux_index is None else aux_index).encode(
+                "ascii"
+            )
+            state_frame = pack_int_lists(flatten_optional_indices(state_indices), "i")
+        return [
+            GUARD,
+            METADATA_MSG,
+            str(bootstrap_room).encode("ascii"),
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            self.agent_id.encode("ascii"),
+            kv_frame,
+            aux_frame,
+            state_frame,
+            (
+                str(decode_prefix_len).encode("ascii")
+                if decode_prefix_len is not None
+                else b""
+            ),
+        ]
 
     def _get_or_connect_decode_peer(self, peer_info: DecodePeerInfo) -> DecodePeer:
         with self.decode_peers_lock:
@@ -722,14 +768,12 @@ class UniflowKVManager(CommonKVManager):
             return False
         return True
 
-    def _send_abort_ack_unless_shutdown_failed(
-        self, room: int, target: AckTarget
-    ) -> None:
+    def _send_abort_ack_unless_poisoned(self, room: int, target: AckTarget) -> None:
         # Runs on the transfer worker, after every put queued before the abort.
-        if room in self._failed_shutdown_rooms:
+        if room in self._deferred_ack_poisoned_rooms:
             logger.warning(
-                "Withholding UniFlow ABORT_ACK for room=%s: shutdown after its "
-                "failed put raised",
+                "Withholding UniFlow ABORT_ACK for room=%s: a put failed and its "
+                "writes may still land",
                 room,
             )
             return
@@ -739,15 +783,6 @@ class UniflowKVManager(CommonKVManager):
         """Whether decode or the sender aborted the room, or the sender cleared it."""
         with self.condition:
             return self.request_status.get(room) in (None, KVPoll.Failed)
-
-    def raise_recorded_failure(self, room: int) -> NoReturn:
-        with self.failure_lock:
-            reason = self.failure_records.pop(room, None)
-        raise KVTransferError(
-            room,
-            reason or UNKNOWN_FAILURE_REASON,
-            is_from_another_rank=reason is None,
-        )
 
     def _start_transfer_worker(self) -> None:
         def transfer_worker() -> None:
@@ -764,20 +799,26 @@ class UniflowKVManager(CommonKVManager):
         self,
         room: int,
         kv_indices: npt.NDArray[np.int32],
-        *,
         index_slice: slice,
-        is_last: bool,
-        aux_index: int | None,
-        state_indices: list | None,
-        wait_event: Any | None,
+        is_last_chunk: bool,
+        aux_index: int | None = None,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
+        *,
+        wait_event: Any | None = None,
+        indices_event: Any | None = None,
+        trace_ctx: Any | None = None,
     ) -> None:
+        # UniflowKVSender does not set supports_host_tensor_indices, so the
+        # scheduler hands over host indices and never an indices_event.
+        assert indices_event is None
         self._transfer_queue.put(
             functools.partial(
                 self._do_transfer_request,
                 room,
-                kv_indices,
+                np.ascontiguousarray(kv_indices, dtype=np.int32),
                 index_slice=index_slice,
-                is_last=is_last,
+                is_last=is_last_chunk,
                 aux_index=aux_index,
                 state_indices=state_indices,
                 wait_event=wait_event,
@@ -846,13 +887,13 @@ class UniflowKVManager(CommonKVManager):
                 with self.condition:
                     self.update_status(room, KVPoll.Transferring)
         except UniflowPutError as e:
-            # Shut down before reporting: decode frees the pages on Failed or
-            # ABORT_ACK. If shutdown raised, send neither; decode's timeouts free them.
+            # Its writes may still land (only the RDMA tier's shutdown waits for
+            # them), so the room is never acked. Shut down before reporting
+            # Failed, which a decode without deferred release acts on at once;
+            # if shutdown raised, leave decode to its timeouts.
+            if self.enable_deferred_decode_kv_release:
+                self.poison_deferred_ack_room(room)
             is_shut_down = self._close_decode_peer(info.agent_id)
-            if not is_shut_down:
-                self._failed_shutdown_rooms[room] = None
-                while len(self._failed_shutdown_rooms) > MAX_FAILED_SHUTDOWN_ROOMS:
-                    self._failed_shutdown_rooms.popitem(last=False)
             self.mark_transfer_failure(info, e, should_notify_decode=is_shut_down)
             return
         except Exception as e:
@@ -987,63 +1028,11 @@ class UniflowKVSender(CommonKVSender):
             bootstrap_room,
             req_has_disagg_prefill_dp_rank,
         )
-        self._transfer_start_time: float | None = None
-        # Set by the prefill scheduler before an early send under overlap.
-        self._early_send_wait_event: Any | None = None
-        # Starts the bootstrap timeout: a room whose decode never sends
-        # METADATA must fail rather than hold its prefill KV indefinitely.
-        self.init_time = time.time()
         with mgr.condition:
             reason = mgr.pending_aborts.pop(bootstrap_room, None)
             if reason is not None:
                 mgr.record_failure(bootstrap_room, reason)
                 mgr.update_status(bootstrap_room, KVPoll.Failed)
-
-    def send(
-        self,
-        kv_indices: npt.NDArray[np.int32],
-        state_indices: list | None = None,
-        num_kv_tokens: int | None = None,
-    ):
-        wait_event = self._early_send_wait_event
-        self._early_send_wait_event = None
-        kv_indices, index_slice, is_last, should_skip = self._prepare_send_indices(
-            kv_indices, state_indices
-        )
-        if should_skip:
-            return
-
-        if self._transfer_start_time is None and (
-            len(kv_indices) > 0 or state_indices is not None
-        ):
-            self._transfer_start_time = time.perf_counter()
-
-        self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            np.ascontiguousarray(kv_indices, dtype=np.int32),
-            index_slice=index_slice,
-            is_last=is_last,
-            aux_index=self.aux_index,
-            state_indices=state_indices,
-            wait_event=wait_event,
-        )
-        self._record_transfer_indices(kv_indices, state_indices)
-
-    def poll(self) -> KVPoll:
-        if self.conclude_state is not None:
-            return self.conclude_state
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-            if status == KVPoll.Success and self._transfer_start_time is not None:
-                self._transfer_metric.transfer_latency_s = (
-                    time.perf_counter() - self._transfer_start_time
-                )
-        elif status == KVPoll.Bootstrapping:
-            timeout_result = self._check_bootstrap_timeout()
-            if timeout_result is not None:
-                return timeout_result
-        return status
 
     def clear(self) -> None:
         # Atomic with the transfer worker, and wakes one waiting on this room.
@@ -1064,25 +1053,8 @@ class UniflowKVSender(CommonKVSender):
                 self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.condition.notify_all()
 
-    def failure_exception(self) -> NoReturn:
-        # Prefill clears a sender only on success, so a failed room drops its
-        # local state here, as the Mooncake backend does.
-        if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
-        self.clear()
-        self.kv_mgr.raise_recorded_failure(self.bootstrap_room)
-
 
 class UniflowKVReceiver(CommonKVReceiver):
-    def __init__(
-        self,
-        mgr: UniflowKVManager,
-        bootstrap_addr: str,
-        bootstrap_room: int | None = None,
-    ):
-        self.started_transfer = False
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
-
     def init(self, prefill_dp_rank: int):
         super().init(prefill_dp_rank)
         if self.conclude_state == KVPoll.Failed:
@@ -1152,38 +1124,14 @@ class UniflowKVReceiver(CommonKVReceiver):
                     self.bootstrap_room,
                 )
 
-    def _register_kv_args(self) -> bool:
-        payload = json.dumps(
-            {
-                "agent_id": self.kv_mgr.agent_id,
-                "kv_export_ids": self.kv_mgr.kv_export_ids,
-                "aux_export_ids": self.kv_mgr.aux_export_ids,
-                "state_export_ids": self.kv_mgr.state_export_ids,
-            }
-        ).encode("utf-8")
-        for bootstrap_info in self.bootstrap_infos:
-            try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart([GUARD, REGISTER_MSG, payload])
-            except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    "UniFlow register to prefill "
-                    f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} "
-                    "failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return False
-        return True
-
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: int | None = None,
         state_indices: list | None = None,
         decode_prefix_len: int | None = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
+        device_kv_indices: npt.NDArray[np.int32] | None = None,
     ):
         if not self.bootstrap_infos:
             # No prefill peer: fail now with a reason instead of at the waiting
@@ -1194,78 +1142,14 @@ class UniflowKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
             return
-
-        packed_state_indices = pack_int_lists(
-            flatten_optional_indices(state_indices), "i"
+        super().send_metadata(
+            kv_indices,
+            aux_index,
+            state_indices,
+            decode_prefix_len,
+            destination,
+            device_kv_indices,
         )
-        aux_frame = str(NO_AUX_INDEX if aux_index is None else aux_index).encode(
-            "ascii"
-        )
-        for bootstrap_info in self.bootstrap_infos:
-            is_dummy = bootstrap_info["is_dummy"]
-            try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            GUARD,
-                            METADATA_MSG,
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.kv_mgr.agent_id.encode("ascii"),
-                            kv_indices.tobytes() if not is_dummy else b"",
-                            aux_frame if not is_dummy else b"",
-                            packed_state_indices if not is_dummy else b"",
-                            (
-                                str(decode_prefix_len).encode("ascii")
-                                if decode_prefix_len is not None
-                                else b""
-                            ),
-                        ]
-                    )
-            except zmq.ZMQError:
-                self.invalidate_cached_bootstrap_infos()
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    "UniFlow send_metadata to prefill "
-                    f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} "
-                    "failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return
-
-        self.started_transfer = True
-        # Waiting timeout starts here, not in init().
-        self.init_time = time.time()
-
-    def poll(self) -> KVPoll:
-        if self.conclude_state is not None:
-            return self.conclude_state
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-            return status
-
-        if status == KVPoll.WaitingForInput:
-            timeout_result = self._check_waiting_timeout()
-            if timeout_result is not None:
-                self.conclude_state = timeout_result
-                return timeout_result
-
-        if not self.started_transfer:
-            return status
-
-        # Prefill reports only the terminal status, so decode stays
-        # WaitingForInput until then.
-        return KVPoll.WaitingForInput
-
-    def failure_exception(self) -> NoReturn:
-        if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
-        self.clear()
-        self.kv_mgr.raise_recorded_failure(self.bootstrap_room)
 
 
 class UniflowKVBootstrapServer(CommonKVBootstrapServer):

@@ -35,11 +35,15 @@ timeout.
 
 - Build on the common manager, sender, receiver, and bootstrap server; override
   only the transfer path, the control messages, and status and failure handling.
+  `CommonKVSender` sends and polls, and `CommonKVReceiver` registers, publishes
+  metadata, and polls, through the manager hooks UniFlow implements
+  (`add_transfer_request` and the REGISTER and METADATA message builders).
 - Keep the object model small. `UniflowKVManager` (one per engine rank) owns the
   UniFlow agent, registered segments and export ids, side-channel threads, the
-  decode peer cache, and per-room transfer state. `UniflowKVSender` enqueues
-  prefill chunks; `UniflowKVReceiver` registers decode segments, publishes
-  per-request metadata, and notifies prefill of aborts.
+  decode peer cache, and per-room transfer state. `UniflowKVSender` adds only
+  parked-abort intake and worker wake-ups on `abort()` and `clear()`;
+  `UniflowKVReceiver` adds the one-to-one routing check, its own ABORT frame, and
+  an immediate failure when no prefill peer resolved.
 - Fail fast at init on an unsupported configuration or a missing binding, and
   surface every later failure as `KVPoll.Failed` with a reason, raised as
   `KVTransferError`, rather than hanging or silently falling back.
@@ -85,11 +89,11 @@ prefix length, are optional. Prefill ignores unknown message types without
 logging.
 
 With `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE` (on by default), decode
-waits for ABORT_ACK only for rooms aborted by a scheduler abort request; a room
-it aborts on its waiting timeout is held until the deferred-release timeout.
+holds the pages of a failed or aborted room until every prefill rank acks its
+ABORT or `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT` expires.
 Prefill answers an ABORT that carries the decode address, including one for a
 concluded room, with ABORT_ACK once every put queued before the ABORT has
-returned, unless a failed put for the room did not shut down cleanly (see
+returned, unless a put for the room failed (see
 [Failure and abort semantics](#failure-and-abort-semantics)).
 
 ## Threads and ordering
@@ -123,12 +127,14 @@ worker skips queued chunks of rooms that already concluded.
   most 4096, oldest evicted) and the sender's constructor fails the room. Before
   the KV put, and before the aux and state puts of a last chunk, the worker skips
   a room that was stopped meanwhile.
-- A failed put (error, timeout, or binding exception) drops the cached decode peer
-  and calls the connection's `shutdown()` before anything is reported. If it
-  returns, decode is told Failed. If it raises, prefill sends neither Failed nor
-  that room's ABORT_ACK (tracked for at most 4096 rooms) and leaves decode to its
-  timeouts, which release the pages without proof that the writes stopped. The
-  next transfer to that decode agent reconnects.
+- A failed put (error, timeout, or binding exception) poisons the room's
+  ABORT_ACK, as a failed Mori or NIXL write does, drops the cached decode peer,
+  and calls the connection's `shutdown()` before anything is reported. If
+  shutdown returns, decode is told Failed; if it raises, prefill does not send
+  Failed and leaves decode to its timeouts. Either way decode releases the pages
+  at its deferred-release timeout (without deferred release: on Failed, or at its
+  waiting timeout), without proof that the writes stopped. A new request on the
+  same room is acked again. The next transfer to that decode agent reconnects.
 - Other errors, such as a segment count mismatch or a missing aux index, fail the
   room and notify decode at once.
 
@@ -148,8 +154,8 @@ non-loopback bind address resolves.
 | RDMA | pending and in-flight work to drain, with no deadline |
 | TCP | local lanes and threads; bytes handed to the kernel may still land |
 
-So decode may safely free a request's pages on Failed or ABORT_ACK after a failed
-put only on the RDMA tier.
+So an ack after a failed put would be safe only on the RDMA tier. The backend
+cannot tell which tier carried a batch, so it never acks a room whose put failed.
 
 Decode does not always wait for either message. With
 `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE`, it releases an aborted

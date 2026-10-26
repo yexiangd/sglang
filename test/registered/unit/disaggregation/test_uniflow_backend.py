@@ -46,7 +46,6 @@ from sglang.srt.disaggregation.uniflow.conn import (
     METADATA_MSG,
     NO_AUX_INDEX,
     REGISTER_MSG,
-    UNKNOWN_FAILURE_REASON,
     DecodePeer,
     DecodePeerInfo,
     KVTransferError,
@@ -65,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability.trace import TraceNullContext
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -84,6 +84,8 @@ STATE_BYTES = 512
 NUM_STATE_SLOTS = 4
 
 LOCALHOST = "127.0.0.1"
+# The reason CommonKVSender and CommonKVReceiver report when none was recorded.
+UNKNOWN_FAILURE_REASON = "Failed due to an unknown reason from another rank"
 DECODE_AGENT = "decode-agent"
 DECODE_RANK_PORT = 17000
 PREFILL_RANK_PORT = 18000
@@ -177,7 +179,6 @@ def _bare_manager(**attrs: Any) -> UniflowKVManager:
         decode_peers_lock=threading.Lock(),
         transfer_timeout_ms=1000,
         pending_aborts=OrderedDict(),
-        _failed_shutdown_rooms=OrderedDict(),
         registered_aux_segments=[],
         state_types=[],
         enable_deferred_decode_kv_release=False,
@@ -200,7 +201,7 @@ def _bare_manager(**attrs: Any) -> UniflowKVManager:
         connection_lock=threading.Lock(),
         connection_pool={},
         required_prefill_response_num_table={},
-        prefill_response_tracker=defaultdict(set),
+        prefill_response_tracker={},
         addr_to_rooms_tracker=defaultdict(set),
         enable_staging=False,
         _staging_handler=None,
@@ -284,6 +285,7 @@ def _bare_sender(
         _transfer_metric=KVTransferMetric(),
         _transfer_num_kv_indices=0,
         _transfer_num_state_indices=0,
+        trace_ctx=TraceNullContext(),
     )
     return sender
 
@@ -315,7 +317,6 @@ def _bare_receiver(
         abort_notified=False,
         _abort_generation=None,
         _connection_pool_entries={},
-        started_transfer=False,
         required_dst_info_num=1,
         required_prefill_response_num=1,
         bootstrap_infos=bootstrap_infos,
@@ -695,7 +696,7 @@ def test_abort_ack_runs_after_chunks_queued_before_it() -> None:
         room,
         np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
-        is_last=False,
+        is_last_chunk=False,
         aux_index=0,
         state_indices=None,
         wait_event=None,
@@ -800,6 +801,7 @@ def test_decode_handler_counts_acks_and_applies_status() -> None:
 
     mgr.request_status[room] = KVPoll.WaitingForInput
     mgr.required_prefill_response_num_table[room] = 1
+    mgr.prefill_response_tracker[room] = set()
     for msg in (
         [],
         [b"not-uniflow"],
@@ -834,6 +836,7 @@ def test_prefill_status_frame_round_trips_to_decode(
     decode = _bare_manager()
     decode.request_status[room] = KVPoll.WaitingForInput
     decode.required_prefill_response_num_table[room] = 1
+    decode.prefill_response_tracker[room] = set()
     decode._handle_decode_message(frame)
 
     if error is None:
@@ -850,7 +853,6 @@ def test_receiver_waiting_timeout_notifies_prefill_once() -> None:
     mgr.request_status[room] = KVPoll.WaitingForInput
     sock = _FakeSocket()
     receiver = _bare_receiver(mgr, room, [PREFILL_PEER], sock)
-    receiver.started_transfer = True
     receiver.init_time = time.time() - 1
 
     assert receiver.poll() == KVPoll.Failed
@@ -859,7 +861,8 @@ def test_receiver_waiting_timeout_notifies_prefill_once() -> None:
     assert frame[:3] == [GUARD, ABORT_MSG, _ascii(room)]
     assert frame[3].decode("utf-8").startswith(f"Request {room} timed out")
     assert frame[4:] == [_ascii(LOCALHOST), _ascii(DECODE_RANK_PORT)]
-    mgr.request_status.pop(room)
+    assert receiver.poll() == KVPoll.Failed
+    receiver.clear()
     assert receiver.poll() == KVPoll.Failed
     assert len(sock.sent) == 1
 
@@ -878,15 +881,20 @@ def test_receiver_waiting_timeout_starts_at_send_metadata() -> None:
     assert sock.sent == []
 
 
-def test_receiver_reports_bootstrapping_until_send_metadata() -> None:
+def test_receiver_waits_for_prefill_terminal_status_after_send_metadata() -> None:
     room = 0xC0FFEE_236
-    mgr = _bare_manager()
-    mgr.request_status[room] = KVPoll.Bootstrapping
-    receiver = _bare_receiver(mgr, room, [PREFILL_PEER])
+    mgr = _bare_manager(waiting_timeout=30.0)
+    mgr.request_status[room] = KVPoll.WaitingForInput
+    mgr.required_prefill_response_num_table[room] = 1
+    mgr.prefill_response_tracker[room] = set()
+    receiver = _bare_receiver(mgr, room, [PREFILL_PEER], _FakeSocket())
 
-    assert receiver.poll() == KVPoll.Bootstrapping
-    receiver.started_transfer = True
+    receiver.send_metadata(np.array([1], dtype=np.int32))
+
+    # Prefill sends only the terminal status, so decode waits until it arrives.
     assert receiver.poll() == KVPoll.WaitingForInput
+    mgr._handle_decode_message([GUARD, _ascii(room), _ascii(KVPoll.Success), b"0", b""])
+    assert receiver.poll() == KVPoll.Success
 
 
 def test_receiver_caches_success() -> None:
@@ -915,7 +923,8 @@ def test_send_metadata_without_prefill_peer_fails(
     assert mgr.failure_records[room] == (
         "UniFlow: no prefill peer (empty bootstrap_infos)"
     )
-    assert not receiver.started_transfer
+    assert receiver.conclude_state == KVPoll.Failed
+    assert receiver.init_time is None
 
 
 def test_metadata_frames_round_trip_to_prefill() -> None:
@@ -934,7 +943,6 @@ def test_metadata_frames_round_trip_to_prefill() -> None:
         decode_prefix_len=5,
     )
 
-    assert receiver.started_transfer
     assert receiver.init_time is not None
     real, dummy = sock.sent
     info = TransferInfo.from_zmq(real)
@@ -985,9 +993,9 @@ def test_send_metadata_zmq_error_fails_and_drops_cached_route() -> None:
     assert mgr.request_status[room] == KVPoll.Failed
     assert receiver.conclude_state == KVPoll.Failed
     assert mgr.failure_records[room] == (
-        f"UniFlow send_metadata to prefill {LOCALHOST}:{PREFILL_RANK_PORT} failed"
+        f"send_metadata to prefill {LOCALHOST}:{PREFILL_RANK_PORT} failed"
     )
-    assert not receiver.started_transfer
+    assert receiver.init_time is None
 
 
 def test_register_kv_args_sends_export_ids() -> None:
@@ -1015,7 +1023,7 @@ def test_register_kv_args_zmq_error_fails_room() -> None:
     assert mgr.request_status[room] == KVPoll.Failed
     assert receiver.conclude_state == KVPoll.Failed
     assert mgr.failure_records[room] == (
-        f"UniFlow register to prefill {LOCALHOST}:{PREFILL_RANK_PORT} failed"
+        f"_register_kv_args to prefill {LOCALHOST}:{PREFILL_RANK_PORT} failed"
     )
 
 
@@ -1063,8 +1071,8 @@ def test_receiver_abort_keeps_recorded_failure_reason(cause: str) -> None:
     mgr = _bare_manager()
     mgr.request_status[room] = KVPoll.WaitingForInput
     mgr.required_prefill_response_num_table[room] = 1
+    mgr.prefill_response_tracker[room] = set()
     receiver = _bare_receiver(mgr, room, [PREFILL_PEER], _FakeSocket())
-    receiver.started_transfer = True
     if cause == "waiting-timeout":
         receiver.init_time = time.time() - 1
     else:
@@ -1228,27 +1236,63 @@ def test_sender_enqueues_chunks_in_order() -> None:
 
     (first_args, first_kwargs), (second_args, second_kwargs) = calls
     assert first_args[0] == room
-    assert first_args[1].dtype == np.int32
     assert first_args[1].tolist() == [1, 2]
+    assert first_args[2:] == (slice(0, 2), False)
+    assert isinstance(first_kwargs.pop("trace_ctx"), TraceNullContext)
     assert first_kwargs == dict(
-        index_slice=slice(0, 2),
-        is_last=False,
-        aux_index=2,
+        aux_index=None,
         state_indices=None,
+        num_kv_tokens=None,
         wait_event=event,
+        indices_event=None,
     )
     assert second_args[1].tolist() == [3, 5]
+    assert second_args[2:] == (slice(2, 4), True)
+    assert isinstance(second_kwargs.pop("trace_ctx"), TraceNullContext)
     assert second_kwargs == dict(
-        index_slice=slice(2, 4),
-        is_last=True,
         aux_index=2,
         state_indices=[[0]],
+        num_kv_tokens=None,
         wait_event=None,
+        indices_event=None,
     )
     assert sender._early_send_wait_event is None
     assert sender._transfer_start_time is not None
     assert sender._transfer_num_kv_indices == 4
     assert sender._transfer_num_state_indices == 1
+
+
+def test_add_transfer_request_queues_contiguous_int32_indices() -> None:
+    room = 0xC0FFEE_251
+    mgr = _bare_manager()
+    queued: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    mgr._do_transfer_request = lambda *args, **kwargs: queued.append((args, kwargs))
+    event = object()
+
+    mgr.add_transfer_request(
+        room,
+        np.array([9, 8, 7, 6], dtype=np.int64)[::2],
+        slice(0, 2),
+        True,
+        aux_index=3,
+        state_indices=[[1]],
+        num_kv_tokens=32,
+        wait_event=event,
+        trace_ctx=TraceNullContext(),
+    )
+    _run_queued_tasks(mgr)
+
+    [(args, kwargs)] = queued
+    assert args[0] == room
+    assert args[1].dtype == np.int32 and args[1].flags["C_CONTIGUOUS"]
+    assert args[1].tolist() == [9, 7]
+    assert kwargs == dict(
+        index_slice=slice(0, 2),
+        is_last=True,
+        aux_index=3,
+        state_indices=[[1]],
+        wait_event=event,
+    )
 
 
 def test_dummy_cp_rank_enqueues_nothing() -> None:
@@ -1680,7 +1724,7 @@ def _decode_abort_frame(room: int) -> list[bytes]:
     ]
 
 
-def test_decode_abort_during_put_is_acked_only_after_drain() -> None:
+def test_decode_abort_during_failed_put_is_never_acked() -> None:
     room = 0xC0FFEE_246
     mgr_ref: list[UniflowKVManager] = []
     connection = _DrainingConnection(
@@ -1695,18 +1739,53 @@ def test_decode_abort_during_put_is_acked_only_after_drain() -> None:
         room,
         np.array([0, 1, 2], dtype=np.int32),
         index_slice=slice(0, 3),
-        is_last=True,
+        is_last_chunk=True,
         aux_index=None,
         state_indices=None,
         wait_event=None,
     )
     _run_queued_tasks(mgr)
 
-    assert [parts[0] for parts, _ in frames] == [GUARD, b"ABORT_ACK"]
-    assert all(is_drained for _, is_drained in frames)
+    # Failed reaches decode only after shutdown; the ABORT is never acked, since
+    # only an RDMA shutdown waits for the failed put's writes.
+    [(parts, is_drained)] = frames
+    assert parts[:3] == [GUARD, _ascii(room), _ascii(KVPoll.Failed)]
+    assert is_drained
     # The decode abort stays the recorded cause, not the put timeout it caused.
-    assert frames[0][0][4] == b"client gone"
+    assert parts[4] == b"client gone"
     assert mgr.failure_records[room] == "client gone"
+    assert room in mgr._deferred_ack_poisoned_rooms
+
+
+def test_decode_abort_after_failed_put_is_not_acked_until_room_reuse() -> None:
+    room = 0xC0FFEE_24B
+    connection = _DrainingConnection()
+    mgr, frames = _pending_put_manager(
+        room, connection, enable_deferred_decode_kv_release=True
+    )
+    mgr.add_transfer_request(
+        room,
+        np.array([0, 1, 2], dtype=np.int32),
+        index_slice=slice(0, 3),
+        is_last_chunk=False,
+        aux_index=None,
+        state_indices=None,
+        wait_event=None,
+    )
+    _run_queued_tasks(mgr)
+    [(failed, _)] = frames
+    assert failed[:3] == [GUARD, _ascii(room), _ascii(KVPoll.Failed)]
+
+    mgr._handle_prefill_message(_decode_abort_frame(room))
+    _run_queued_tasks(mgr)
+    assert len(frames) == 1
+
+    # A new request on the same room starts acking again.
+    mgr.request_status.pop(room)
+    mgr.update_status(room, KVPoll.Bootstrapping)
+    mgr._handle_prefill_message(_decode_abort_frame(room))
+    _run_queued_tasks(mgr)
+    assert [parts[0] for parts, _ in frames[1:]] == [b"ABORT_ACK"]
 
 
 def test_failed_shutdown_after_put_failure_leaves_decode_to_its_timeouts() -> None:
@@ -1747,7 +1826,7 @@ def test_decode_abort_during_put_with_failed_shutdown_is_not_acked() -> None:
         room,
         np.array([0, 1, 2], dtype=np.int32),
         index_slice=slice(0, 3),
-        is_last=True,
+        is_last_chunk=True,
         aux_index=None,
         state_indices=None,
         wait_event=None,
@@ -1769,7 +1848,7 @@ def test_decode_abort_after_failed_shutdown_is_not_acked() -> None:
         room,
         np.array([0, 1, 2], dtype=np.int32),
         index_slice=slice(0, 3),
-        is_last=False,
+        is_last_chunk=False,
         aux_index=None,
         state_indices=None,
         wait_event=None,
