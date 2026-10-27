@@ -8,8 +8,9 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -151,6 +152,21 @@ class TransferInfo:
         )
 
 
+class DraftKvHeadSlices(msgspec.Struct, frozen=True):
+    """Draft KV copy for a decode rank that shards the draft heads more finely.
+
+    MLA target KV is replicated across attention TP, but an appended MHA draft
+    pool is head-sharded, so the decode rank receives its head slice of every
+    draft token. Planned once when the decode rank registers.
+    """
+
+    # Decode buffer paired with each local target entry, for the page copy.
+    target_dst_ptrs: List[int]
+    # (src_ptr, dst_ptr, src_row_width, dst_row_width, copy_width) per draft
+    # entry, with the source pointer moved to the decode rank's heads.
+    draft_slices: List[Tuple[int, int, int, int, int]]
+
+
 # decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
@@ -173,6 +189,9 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    # Set at registration when this decode rank needs a head slice of the
+    # draft KV; None keeps the page copy.
+    draft_kv_head_slices: Optional[DraftKvHeadSlices] = None
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
@@ -923,13 +942,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _publish_peer_registration(
         self, mooncake_session_id: str, decode_kv_args: KVArgsRegisterInfo
     ) -> Optional[str]:
-        """Record this peer's state-layout verdict, then publish its metadata.
+        """Judge this peer's layout and plan its draft KV, then publish its metadata.
 
         Publishing last stops a transfer from reading the new layout while the
         previous registration's verdict still stands. Returns the rejection
         reason, if any.
         """
         fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
+        if mismatch is None:
+            try:
+                # Every transfer to this peer reuses the plan.
+                decode_kv_args.draft_kv_head_slices = self._plan_draft_kv_head_slices(
+                    decode_kv_args
+                )
+            except ValueError as e:
+                mismatch = str(e)
+            except Exception as e:
+                # Entry pairing can fail on its own, as it would in the transfer;
+                # reject the peer rather than kill the bootstrap thread.
+                mismatch = f"Could not plan the draft KV transfer: {e!r}"
         self.check_peer_aux_buffer_count(
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )
@@ -1363,6 +1394,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        draft_kv_head_slices: Optional[DraftKvHeadSlices] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1388,20 +1420,197 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 host_backed_kv_count = len(dst_kv_ptrs) - num_draft_entries
             dst_device_kv_ptrs = set(dst_kv_ptrs[host_backed_kv_count:])
-        return self._send_kvcache_generic(
+        src_data_ptrs = self.kv_args.kv_data_ptrs
+        item_lens = self.kv_args.kv_item_lens
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if draft_kv_head_slices is not None:
+            # Registration already paired the entries: the target keeps the
+            # page copy, and the draft entries are sliced after it.
+            num_target = len(draft_kv_head_slices.target_dst_ptrs)
+            src_data_ptrs = src_data_ptrs[:num_target]
+            item_lens = item_lens[:num_target]
+            dst_kv_ptrs = draft_kv_head_slices.target_dst_ptrs
+            src_layer_ids = dst_layer_ids = None
+        ret = self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_data_ptrs=src_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
-            item_lens=self.kv_args.kv_item_lens,
+            item_lens=item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
             force_flat=get_memory().enable_unified_memory,
-            src_layer_ids=self.kv_args.kv_layer_ids,
+            src_layer_ids=src_layer_ids,
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
+        if ret != 0 or draft_kv_head_slices is None:
+            return ret
+        # The draft suffix is device-backed whenever device page ids are sent.
+        return self._send_draft_kv_head_slices(
+            mooncake_session_id=mooncake_session_id,
+            prefill_kv_indices=prefill_kv_indices,
+            dst_kv_indices=(
+                dst_kv_indices
+                if dst_device_kv_indices is None
+                else dst_device_kv_indices
+            ),
+            draft_slices=draft_kv_head_slices.draft_slices,
+            executor=executor,
+        )
+
+    def _plan_draft_kv_head_slices(
+        self, registration_info: KVArgsRegisterInfo
+    ) -> Optional[DraftKvHeadSlices]:
+        """Plan the draft KV copy for a decode rank that splits draft heads differently.
+
+        MLA target KV is replicated across attention TP, but an appended MHA
+        draft pool is head-sharded, so its page size follows the TP size. A
+        smaller prefill TP holds every draft head the decode rank needs and
+        sends that slice of each token. Returns None when the draft pages
+        already match or another path moves them. Raises ValueError for a split
+        this cannot serve.
+        """
+        num_draft = getattr(self.kv_args, "num_draft_entries", 0)
+        if not (
+            num_draft
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+            and not registration_info.requires_dcp_relayout
+            and registration_info.dst_kv_item_lens
+        ):
+            return None
+        dst_kv_ptrs = registration_info.dst_kv_ptrs
+        dst_kv_item_lens = registration_info.dst_kv_item_lens
+        dst_layer_ids = registration_info.dst_kv_layer_ids
+        dst_attn_tp_size = registration_info.dst_attn_tp_size
+        src_ptrs = self.kv_args.kv_data_ptrs
+        src_lens = self.kv_args.kv_item_lens
+        if len(dst_kv_item_lens) != len(dst_kv_ptrs):
+            raise ValueError(
+                f"Decode published {len(dst_kv_item_lens)} KV item lengths for "
+                f"{len(dst_kv_ptrs)} KV buffers"
+            )
+        # Pair entries the way _send_kvcache_generic does.
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_indices = [
+                j
+                for _, j in build_transfer_entry_pairs(
+                    src_layer_ids,
+                    dst_layer_ids or [],
+                    len(src_ptrs),
+                    len(dst_kv_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+            ]
+            paired_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+            paired_lens = [dst_kv_item_lens[j] for j in dst_indices]
+        else:
+            _, paired_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_ptrs, dst_kv_ptrs)
+            _, paired_lens, _ = self.get_mla_kv_ptrs_with_pp(src_lens, dst_kv_item_lens)
+        num_target = len(src_ptrs) - num_draft
+        if src_lens[num_target:] == paired_lens[num_target:]:
+            return None
+
+        if self.attn_cp_size > 1:
+            # Without attention DP the draft runs on the full TP group, so its
+            # heads do not follow attention TP; CP is rejected as a whole.
+            raise ValueError(
+                "PD draft KV head slicing does not support prefill attention CP: "
+                f"attn_cp_size={self.attn_cp_size}"
+            )
+        src_tp = self.attn_tp_size
+        if dst_attn_tp_size <= src_tp or dst_attn_tp_size % src_tp:
+            # Equal TP sizes cannot split the heads differently. With a larger
+            # prefill TP, the decode rank gets KV from one prefill rank only
+            # (the others are dummy or skip replicated KV), so the other
+            # ranks' draft heads would never arrive.
+            raise ValueError(
+                "PD draft KV head slicing needs a decode attention TP that is a "
+                f"multiple of a smaller prefill attention TP: prefill={src_tp}, "
+                f"decode={dst_attn_tp_size}"
+            )
+        layout = self.kv_args.draft_kv_cache_layout
+        if layout != "nhd":
+            # A head slice of a token row needs token-major NHD pages; HND and
+            # vectorized_5d pages have the same size in another element order.
+            raise ValueError(
+                f"PD draft KV head slicing needs the NHD KV cache layout, got {layout}"
+            )
+        tp_ratio = dst_attn_tp_size // src_tp
+        page_size = self.kv_args.page_size
+        draft_slices = []
+        for i in range(num_target, len(src_ptrs)):
+            src_width, src_rem = divmod(src_lens[i], page_size)
+            dst_width, dst_rem = divmod(paired_lens[i], page_size)
+            heads_ratio = src_width // dst_width if dst_width > 0 else 0
+            if (
+                src_rem
+                or dst_rem
+                or heads_ratio == 0
+                or heads_ratio * dst_width != src_width
+                or tp_ratio % heads_ratio
+            ):
+                raise ValueError(
+                    f"PD draft KV entry {i} does not split into decode head shards: "
+                    f"prefill item_len={src_lens[i]}, decode item_len="
+                    f"{paired_lens[i]}, page_size={page_size}, attention TP "
+                    f"{src_tp}->{dst_attn_tp_size}"
+                )
+            # Decode ranks that share a head (heads < TP) read the same slice.
+            dst_shard = registration_info.dst_tp_rank // (tp_ratio // heads_ratio)
+            src_offset = dst_shard * dst_width % src_width
+            draft_slices.append(
+                (
+                    src_ptrs[i] + src_offset,
+                    paired_ptrs[i],
+                    src_width,
+                    dst_width,
+                    dst_width,
+                )
+            )
+        return DraftKvHeadSlices(
+            target_dst_ptrs=paired_ptrs[:num_target], draft_slices=draft_slices
+        )
+
+    def _send_draft_kv_head_slices(
+        self,
+        *,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        draft_slices: List[Tuple[int, int, int, int, int]],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Copy the decode rank's slice of every draft token, one block per token."""
+        page_size = self.kv_args.page_size
+        token_offsets = np.arange(page_size, dtype=np.int64)
+        src_rows, dst_rows = (
+            (
+                np.asarray(pages, dtype=np.int64)[:, None] * page_size + token_offsets
+            ).ravel()
+            for pages in (prefill_kv_indices, dst_kv_indices)
+        )
+
+        def send(slices: List[Tuple[int, int, int, int, int]]) -> int:
+            return _send_token_row_slices(
+                transfer_data=self._transfer_data,
+                mooncake_session_id=mooncake_session_id,
+                src_rows=src_rows,
+                dst_rows=dst_rows,
+                slices=slices,
+                batch_size=self.max_transfer_batch_indices,
+            )
+
+        if (
+            self.enable_custom_mem_pool
+            and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+        ):
+            return self._await_transfer_futures(
+                [executor.submit(send, [draft_slice]) for draft_slice in draft_slices]
+            )
+        return send(draft_slices)
 
     def send_kvcache_dcp(
         self,
@@ -1590,24 +1799,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
 
         def process_sliced_draft(params) -> int:
-            batch_size = self.max_transfer_batch_indices
-            if batch_size <= 0:
-                batch_size = 4096
-            for start in range(0, plan.draft_src_token_indices.size, batch_size):
-                src_indices = plan.draft_src_token_indices[start : start + batch_size]
-                dst_indices = plan.draft_dst_token_indices[start : start + batch_size]
-                blocks = []
-                for src_ptr, dst_ptr, src_width, dst_width, copy_width in params:
-                    src_addrs = src_ptr + src_indices * src_width
-                    dst_addrs = dst_ptr + dst_indices * dst_width
-                    blocks.extend(
-                        (int(src), int(dst), copy_width)
-                        for src, dst in zip(src_addrs, dst_addrs)
-                    )
-                ret = self._transfer_data(mooncake_session_id, blocks)
-                if ret != 0:
-                    return ret
-            return 0
+            return _send_token_row_slices(
+                transfer_data=self._transfer_data,
+                mooncake_session_id=mooncake_session_id,
+                src_rows=plan.draft_src_token_indices,
+                dst_rows=plan.draft_dst_token_indices,
+                slices=params,
+                batch_size=self.max_transfer_batch_indices,
+            )
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
@@ -2712,6 +2911,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                draft_kv_head_slices=target_rank_registration_info.draft_kv_head_slices,
                             )
                         elif (
                             self.enable_staging
@@ -3011,7 +3211,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     if layout_mismatch is not None:
                         logger.error(
-                            "Rejecting state transfers to decode session %s: %s",
+                            "Rejecting transfers to decode session %s: %s",
                             mooncake_session_id,
                             layout_mismatch,
                         )
@@ -3363,3 +3563,35 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
     pass
+
+
+def _send_token_row_slices(
+    *,
+    transfer_data: Callable[[str, List[Tuple[int, int, int]]], int],
+    mooncake_session_id: str,
+    src_rows: npt.NDArray[np.int64],
+    dst_rows: npt.NDArray[np.int64],
+    slices: List[Tuple[int, int, int, int, int]],
+    batch_size: int,
+) -> int:
+    """Copy part of every token row, one block per token, in bounded batches.
+
+    Each slice is (src_ptr, dst_ptr, src_row_width, dst_row_width, copy_width),
+    with both pointers already moved to the copied part of the row.
+    """
+    if batch_size <= 0:
+        batch_size = 4096
+    for start in range(0, src_rows.size, batch_size):
+        src_batch = src_rows[start : start + batch_size]
+        dst_batch = dst_rows[start : start + batch_size]
+        blocks = []
+        for src_ptr, dst_ptr, src_width, dst_width, copy_width in slices:
+            src_addrs = (src_ptr + src_batch * src_width).tolist()
+            dst_addrs = (dst_ptr + dst_batch * dst_width).tolist()
+            blocks.extend(
+                (src, dst, copy_width) for src, dst in zip(src_addrs, dst_addrs)
+            )
+        ret = transfer_data(mooncake_session_id, blocks)
+        if ret != 0:
+            return ret
+    return 0

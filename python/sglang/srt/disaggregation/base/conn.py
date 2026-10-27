@@ -89,6 +89,9 @@ class KVArgs:
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
+    # Physical layout of the prefill's draft KV buffers ("nhd" or
+    # "vectorized_5d"); None without a draft or for a pool that declares none.
+    draft_kv_cache_layout: Optional[str] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int

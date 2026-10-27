@@ -524,6 +524,8 @@ Enable the staging buffer when prefill and decode use **different TP sizes** wit
 
 > **Note:** You can use different attention TP sizes for hybrid sliding-window models (e.g. `openai/gpt-oss-120b`) with Mooncake or NIXL. For unequal TP, both backends transfer the sliding-window KV by token and KV-head slice. The staging buffer carries only full-attention KV. Use `--pp-size 1` and leave `--enable-unified-memory` disabled for this configuration. MXFP8 KV cache is not supported for unequal-TP SWA transfer.
 
+> **Note:** For MLA and hybrid-MLA models with a head-sharded draft KV cache (e.g. a DFLASH draft), Mooncake moves the draft KV by token and head slice when the decode attention TP is a multiple of the prefill attention TP. This needs the default NHD KV cache layout and no prefill attention CP. Other combinations are rejected when the decode server registers, including a larger prefill attention TP, since each decode rank receives KV from only one prefill rank. The Ascend backend rejects every combination that needs this slicing.
+
 ### Environment Variables
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

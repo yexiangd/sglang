@@ -10,6 +10,8 @@ from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngin
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
+    DraftKvHeadSlices,
+    KVArgsRegisterInfo,
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -269,6 +271,16 @@ class AscendKVManager(MooncakeKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
+    def _plan_draft_kv_head_slices(self, registration_info: KVArgsRegisterInfo) -> None:
+        """Reject a decode rank that needs a draft head slice: send_kvcache
+        below copies whole draft pages."""
+        if super()._plan_draft_kv_head_slices(registration_info) is not None:
+            raise ValueError(
+                "Ascend PD cannot slice draft KV heads across attention TP sizes: "
+                f"prefill={self.attn_tp_size}, "
+                f"decode={registration_info.dst_attn_tp_size}"
+            )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -280,6 +292,8 @@ class AscendKVManager(MooncakeKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        # Always None here: _plan_draft_kv_head_slices rejects such peers.
+        draft_kv_head_slices: Optional[DraftKvHeadSlices] = None,
     ):
         if dst_device_kv_indices is not None:
             raise NotImplementedError(

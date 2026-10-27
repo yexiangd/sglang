@@ -315,6 +315,11 @@ class PrefillBootstrapQueue:
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             num_draft_entries = len(draft_kv_data_ptrs)
+            # Wrapper pools register the buffers of their full-attention pool.
+            draft_buffer_pool = getattr(draft_kv_pool, "full_kv_pool", draft_kv_pool)
+            kv_args.draft_kv_cache_layout = getattr(
+                draft_buffer_pool, "kv_cache_layout", None
+            )
 
         dcp_remote_decode_layout = []
         if self.transfer_backend == TransferBackend.ASCEND:

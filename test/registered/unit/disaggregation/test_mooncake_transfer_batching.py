@@ -492,6 +492,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
             dst_attn_tp_size=1,
+            draft_kv_head_slices=None,
         )
         manager = SimpleNamespace(
             enable_trace=False,
