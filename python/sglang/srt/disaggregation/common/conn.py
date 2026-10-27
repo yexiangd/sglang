@@ -448,6 +448,9 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            # Rooms owned by a live sender. A decode registration can create a
+            # room's status first, so request_status cannot tell this.
+            self.sender_rooms: Set[int] = set()
             self.decode_kv_args_table = {}
             self.pp_group = get_parallel().pp_group
             if self.pp_size > 1:
@@ -2107,6 +2110,9 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    _owns_bootstrap_room: bool = True
+    _duplicate_room_reason: Optional[str] = None
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -2151,6 +2157,15 @@ class CommonKVSender(BaseKVSender):
                 mgr.update_status(bootstrap_room, KVPoll.Failed)
                 self.conclude_state = KVPoll.Failed
                 return
+        elif bootstrap_room in mgr.sender_rooms:
+            # Sharing the room would mix two requests' status, transfer targets
+            # and cleanup. Fail this request alone and leave the owner running.
+            self._owns_bootstrap_room = False
+            self._duplicate_room_reason = "Duplicate prefill bootstrap room"
+            self.conclude_state = KVPoll.Failed
+            return
+        else:
+            mgr.sender_rooms.add(bootstrap_room)
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -2407,17 +2422,21 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        # A duplicate never owned the room and a cleared sender no longer does;
+        # the room's state may belong to another request.
+        if not self._owns_bootstrap_room:
+            return
+        self._owns_bootstrap_room = False
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
-            if not self._owns_bootstrap_room:
-                return
             notification = self.kv_mgr.deferred_bootstrap.close(
                 self.bootstrap_room,
                 self,
                 success=self.kv_mgr.request_status.get(self.bootstrap_room)
                 == KVPoll.Success,
             )
-            self._owns_bootstrap_room = False
+        else:
+            self.kv_mgr.sender_rooms.discard(self.bootstrap_room)
         if self.conclude_state is None:
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
@@ -2446,8 +2465,13 @@ class CommonKVSender(BaseKVSender):
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
         self.clear()
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        # A duplicate must not consume the owner's failure record.
+        failure_reason = self._duplicate_room_reason
+        if failure_reason is None:
+            with self.kv_mgr.failure_lock:
+                failure_reason = self.kv_mgr.failure_records.pop(
+                    self.bootstrap_room, None
+                )
         self.trace_ctx.trace_req_finish()
         raise KVTransferError(
             self.bootstrap_room,
@@ -2456,7 +2480,7 @@ class CommonKVSender(BaseKVSender):
         )
 
     def abort(self):
-        if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
+        if not self._owns_bootstrap_room:
             return
         self.kv_mgr.record_failure(
             self.bootstrap_room,
@@ -2471,6 +2495,7 @@ class CommonKVSender(BaseKVSender):
 class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
+    _duplicate_room_reason: Optional[str] = None
     _lifecycle_lock = nullcontext()
 
     _ctx = zmq.Context()
@@ -2497,13 +2522,17 @@ class CommonKVReceiver(BaseKVReceiver):
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
-        self._owns_bootstrap_room = not (
-            mgr.defer_decode_allocation and bootstrap_room in mgr.request_status
-        )
+        # Unlike prefill, decode opens a room only in its receiver, so a live
+        # room belongs to another request. Sharing it would mix the two
+        # requests' status and cleanup.
+        self._owns_bootstrap_room = bootstrap_room not in mgr.request_status
         if not self._owns_bootstrap_room:
-            mgr.record_failure(bootstrap_room, "Duplicate decode bootstrap room")
-            mgr.update_status(bootstrap_room, KVPoll.Failed)
+            self._duplicate_room_reason = "Duplicate decode bootstrap room"
             self.conclude_state = KVPoll.Failed
+            if mgr.defer_decode_allocation:
+                # prefill_complete fails the whole room, as its prefill side does.
+                mgr.record_failure(bootstrap_room, self._duplicate_room_reason)
+                mgr.update_status(bootstrap_room, KVPoll.Failed)
             return
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.prefill_response_tracker.setdefault(self.bootstrap_room, set())
@@ -2932,20 +2961,32 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = (
                 status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
             )
+        if self.conclude_state == KVPoll.Success:
+            # A failure recorded after this request succeeded, such as a late
+            # prefill_complete duplicate's, has no reader. Drop it so a request
+            # that reuses the room does not report it as its own.
+            with self.kv_mgr.failure_lock:
+                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
-        if self.kv_mgr.defer_decode_allocation:
-            self._owns_bootstrap_room = False
+        # The room may be reused now. A later clear(), such as the one after a
+        # deferred KV release, must not tear down the next owner.
+        self._owns_bootstrap_room = False
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
         self.clear()
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        # A duplicate must not consume the owner's failure record.
+        failure_reason = self._duplicate_room_reason
+        if failure_reason is None:
+            with self.kv_mgr.failure_lock:
+                failure_reason = self.kv_mgr.failure_records.pop(
+                    self.bootstrap_room, None
+                )
         raise KVTransferError(
             self.bootstrap_room,
             failure_reason or "Failed due to an unknown reason from another rank",

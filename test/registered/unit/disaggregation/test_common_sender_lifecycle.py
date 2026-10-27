@@ -31,6 +31,7 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager._staging_outstanding = {}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
+    manager.sender_rooms = set()
     manager._num_shards = 1
     manager.transfer_queues = [queue.Queue()]
     manager._transfer_queues = manager.transfer_queues

@@ -597,18 +597,20 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
-        sender = object.__new__(MooncakeKVSender)
-        sender.kv_mgr, sender.bootstrap_room = manager, 42
-        sender.conclude_state = None
         target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
+                # A cleared sender gives up its room, so each case needs its own.
+                sender = object.__new__(MooncakeKVSender)
+                sender.kv_mgr, sender.bootstrap_room = manager, 42
+                sender.conclude_state = None
                 manager.request_status = {42: KVPoll.Failed}
                 manager.req_to_decode_prefix_len = {}
                 manager.transfer_infos = {}
                 manager._staging_outstanding = {42: outstanding}
                 manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
                 manager._deferred_ack_poisoned_rooms = set()
+                manager.sender_rooms = set()
                 with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
                     if outstanding:
