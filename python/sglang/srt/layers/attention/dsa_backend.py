@@ -3325,6 +3325,12 @@ class DeepseekSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        # Eager DP attention can pad q past the rows the FlashMLA metadata was
+        # planned for (e.g. the pre-pad eager draft decode plan). Run only the
+        # planned rows; the output is restored below for MLP/EP collectives.
+        q_all, page_table_1, num_padding_rows = _trim_trtllm_decode_dp_padding(
+            q_all, page_table_1, cache_seqlens.shape[0]
+        )
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -3368,7 +3374,7 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
-        return o
+        return _restore_trtllm_decode_dp_padding(o, num_padding_rows)
 
     def _forward_standard_mha(
         self,

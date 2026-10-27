@@ -283,6 +283,120 @@ class TestDSABackendDPPadding(CustomTestCase):
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
 
+    def test_flashmla_kv_decode_runs_planned_rows_then_restores_physical_batch(self):
+        # attn_tp_size 4 with draft tokens [3, 1] per DP rank: the pre-pad plan
+        # covers max(3, 1) rows, while the attn-TP aligned q has 4 rows.
+        self._check_flashmla_kv_padding(q_rows=4)
+
+    def test_flashmla_kv_decode_without_dp_padding_is_unchanged(self):
+        self._check_flashmla_kv_padding(q_rows=3)
+
+    def _check_flashmla_kv_padding(self, *, q_rows):
+        planned_rows = 3
+        num_q_heads, padded_q_heads, head_dim, v_head_dim, topk = 2, 4, 6, 4, 8
+        # One real request; pad_dsa_cache_seqlens zero-fills the other rows.
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([8, 0, 0], dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.zeros(1, dtype=torch.int32),
+                num_splits=torch.zeros(planned_rows + 1, dtype=torch.int32),
+            ),
+        )
+        backend = SimpleNamespace(
+            forward_metadata=metadata,
+            dsa_decode_impl="flashmla_kv",
+            hisparse_coordinator=None,
+            use_fused_topk=True,
+            token_to_kv_pool=SimpleNamespace(
+                get_key_buffer=lambda _layer_id: torch.zeros((64, 1, 3))
+            ),
+            flashmla_kv_num_q_heads=padded_q_heads,
+            physical_page_size=64,
+            kv_cache_dim=3,
+            dsa_kv_cache_store_fp8=True,
+            dsa_index_topk=topk,
+            flashmla_kv_format="V32",
+            _resolve_kpool_tail_backend=lambda indices, impl: impl,
+            _check_kpool_tail_backend=lambda *args: None,
+            _get_fused_topk_page_table=lambda indices: indices,
+        )
+        backend._pad_topk_indices = MethodType(
+            DeepseekSparseAttnBackend._pad_topk_indices, backend
+        )
+        backend._forward_flashmla_kv = MethodType(
+            DeepseekSparseAttnBackend._forward_flashmla_kv, backend
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            is_cross_attention=False,
+            scaling=1.0,
+        )
+
+        kernel_output = 1 + torch.arange(
+            planned_rows * padded_q_heads * v_head_dim, dtype=torch.float32
+        ).view(planned_rows, 1, padded_q_heads, v_head_dim)
+        captured = {}
+
+        def fake_flash_mla_with_kvcache(
+            *, q, cache_seqlens, num_splits, indices, block_table, **kwargs
+        ):
+            # Like the FlashMLA decode kernel: one metadata row per q row.
+            batch_size = q.shape[0]
+            if num_splits.shape != (batch_size + 1,):
+                raise RuntimeError("num_splits must have shape (b+1)")
+            self.assertEqual(cache_seqlens.shape, (batch_size,))
+            self.assertEqual(indices.shape, (batch_size, 1, topk))
+            self.assertEqual(block_table.shape[0], batch_size)
+            captured["q"] = q
+            return kernel_output[:batch_size], None
+
+        flash_mla_interface = ModuleType(
+            "sglang.kernels.ops.attention.flash_mla_interface"
+        )
+        flash_mla_interface.flash_mla_with_kvcache = fake_flash_mla_with_kvcache
+
+        q = torch.arange(q_rows * num_q_heads * head_dim, dtype=torch.float32).view(
+            q_rows, num_q_heads * head_dim
+        )
+        # The indexer returns -1 rows for the DP padding after the real request.
+        topk_indices = torch.full((q_rows, topk), -1, dtype=torch.int32)
+        topk_indices[0] = torch.arange(topk, dtype=torch.int32)
+        with (
+            patch.dict(
+                "sys.modules", {flash_mla_interface.__name__: flash_mla_interface}
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.concat_mla_absorb_q_general",
+                side_effect=lambda q_nope, q_rope: torch.cat((q_nope, q_rope), dim=-1),
+            ),
+        ):
+            output = DeepseekSparseAttnBackend.forward_decode(
+                backend,
+                q=q,
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=SimpleNamespace(),
+                save_kv_cache=False,
+                topk_indices=topk_indices,
+            )
+
+        self.assertEqual(
+            captured["q"].shape, (planned_rows, 1, padded_q_heads, head_dim)
+        )
+        torch.testing.assert_close(
+            captured["q"][:, 0, :num_q_heads],
+            q[:planned_rows].view(planned_rows, num_q_heads, head_dim),
+        )
+        self.assertEqual(output.shape, (q_rows, 1, num_q_heads, v_head_dim))
+        torch.testing.assert_close(
+            output[:planned_rows], kernel_output[:, :, :num_q_heads]
+        )
+        self.assertTrue(torch.all(output[planned_rows:] == 0))
+
 
 if __name__ == "__main__":
     unittest.main()
