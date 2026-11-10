@@ -38,12 +38,17 @@ timeout.
   `CommonKVSender` sends and polls, and `CommonKVReceiver` registers, publishes
   metadata, and polls, through the manager hooks UniFlow implements
   (`add_transfer_request` and the REGISTER and METADATA message builders).
-- Keep the object model small. `UniflowKVManager` (one per engine rank) owns the
-  UniFlow agent, registered segments and export ids, side-channel threads, the
-  decode peer cache, and per-room transfer state. `UniflowKVSender` adds only
-  parked-abort intake and worker wake-ups on `abort()` and `clear()`;
-  `UniflowKVReceiver` adds the one-to-one routing check, its own ABORT frame, and
-  an immediate failure when no prefill peer resolved.
+- Keep the object model small. `UniflowKVManager` (one per engine rank) is the
+  protocol: it owns the side-channel threads, the decode peer cache, per-room
+  transfer state, and the transfer timeout, and plans every put as `Copy` byte
+  ranges over `UniflowBufferKey` names (`buffers.py`). `UniflowTransport`
+  (`transport.py`) implements the per-backend `Transport` interface
+  (`disaggregation/transport/base.py`) and owns the UniFlow agent, registered
+  segments and export ids, imported peer segments, connections, puts, and the
+  accept loop. `UniflowKVSender` adds only parked-abort intake and worker
+  wake-ups on `abort()` and `clear()`; `UniflowKVReceiver` adds the one-to-one
+  routing check, its own ABORT frame, and an immediate failure when no prefill
+  peer resolved.
 - Fail fast at init on an unsupported configuration or a missing binding, and
   surface every later failure as `KVPoll.Failed` with a reason, raised as
   `KVTransferError`, rather than hanging or silently falling back.
@@ -166,6 +171,31 @@ any tier a put that stalls to its deadline can still be writing when decode
 releases the pages. A deferred-release timeout well above the transfer timeout
 narrows this window but does not close it.
 
+## Transport interface
+
+`UniflowTransport` maps the `Transport` methods onto the binding:
+
+| Method | UniFlow |
+|---|---|
+| `register(key, ptr, length, device)` | `register_segment` as VRAM on `device`, or as DRAM with device id -1 for host memory (`device` -1); one segment and export id per key, because REGISTER carries an export id per buffer |
+| `deregister(keys)` | drops the registered segments; destroying a segment deregisters it |
+| `write` / `write_all` | one `put()` batch per call, with one request per range row |
+| `status` | polls the batch's future without blocking |
+| `close` | shuts down the connections it opened and drops every registration |
+
+Its other methods are UniFlow-specific: `create()` builds the agent,
+`export_ids()` feeds REGISTER, `import_registration()` imports a decode peer's
+segments and then connects, `disconnect()` shuts a peer's connection down,
+`wait_all()` blocks on put batches up to a deadline, and `start_accepting()` runs
+the accept loop.
+
+The manager keeps every protocol decision: it keeps KV, aux, and state in
+separate `write_all()` calls, so device KV keeps the intra-host GPU peer tier
+while host aux does not; it applies the transfer timeout through `wait_all()`;
+and it decides to drop and shut down a decode peer after a failed put. A
+zero-length buffer, such as an elided DSA index-K layer, is not registered,
+exports an empty id, and moves nothing, as in the other backends.
+
 ## Correctness requirements
 
 - KV pages, aux data, and state transfer bit-exactly; the last chunk carries aux
@@ -178,7 +208,8 @@ narrows this window but does not close it.
 ## Testing
 
 - `test/registered/unit/disaggregation/test_uniflow_backend.py`: CPU tests of
-  the connector with a fake `uniflow._core`.
+  the connector over a real `UniflowTransport` and a fake `uniflow._core`
+  (`python/sglang/test/uniflow_utils.py`).
 - `test/registered/amd/disaggregation/test_uniflow_transfer_engine_gpu.py`: KV,
   aux, and state transfer between two GPUs on the real binding.
 - `test/registered/amd/disaggregation/test_uniflow_transfer_engine_e2e.py`:

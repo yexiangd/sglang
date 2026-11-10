@@ -9,13 +9,11 @@ host memory.
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import hashlib
 import logging
 import queue
 import re
 import socket
-import struct
 import sys
 import threading
 import time
@@ -43,7 +41,9 @@ from sglang.srt.disaggregation.common.conn import (
     KVTransferError,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.transport.base import Copy
 from sglang.srt.disaggregation.uniflow import conn as uniflow_conn
+from sglang.srt.disaggregation.uniflow.buffers import BufferKeys, copy_ranges
 from sglang.srt.disaggregation.uniflow.conn import (
     ABORT_MSG,
     DEFAULT_ABORT_REASON,
@@ -51,8 +51,8 @@ from sglang.srt.disaggregation.uniflow.conn import (
     METADATA_MSG,
     NO_AUX_INDEX,
     REGISTER_MSG,
-    DecodePeer,
     DecodePeerInfo,
+    PeerBuffers,
     TransferInfo,
     UniflowKVBootstrapServer,
     UniflowKVManager,
@@ -70,6 +70,11 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.trace import TraceNullContext
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.uniflow_utils import (
+    attach_uniflow_transport,
+    fake_uniflow_core,
+    peer_buffers,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -104,6 +109,13 @@ SINGLE_RANK_PARALLEL = dict(
     attn_dp_rank=0,
     pp_group=None,
 )
+
+
+# Local buffer names of a bare manager without and with one aux buffer.
+NO_BUFFER_KEYS = BufferKeys.for_buffers([], [], [])
+ONE_AUX_KEYS = BufferKeys.for_buffers([], [0], [])
+# A host region large enough for every span the unit tests address.
+REGION = (0, 1 << 20)
 
 
 def _ascii(value: object) -> bytes:
@@ -178,11 +190,11 @@ def _bare_manager(**attrs: Any) -> UniflowKVManager:
         transfer_infos={},
         req_to_decode_prefix_len={},
         decode_peer_infos={},
-        decode_peers={},
+        _peers={},
         decode_peers_lock=threading.Lock(),
         transfer_timeout_ms=1000,
         pending_aborts=OrderedDict(),
-        registered_aux_segments=[],
+        _local_keys=NO_BUFFER_KEYS,
         state_types=[],
         enable_deferred_decode_kv_release=False,
         _transfer_queue=queue.Queue(),
@@ -383,7 +395,7 @@ def test_manager_opts_into_deferred_decode_kv_release() -> None:
 
 def test_success_status_survives_decode_notification_failure() -> None:
     room = 0xC0FFEE_201
-    mgr = _bare_manager(registered_aux_segments=["aux-segment"])
+    mgr = _bare_manager(_local_keys=ONE_AUX_KEYS)
     _ready_room(mgr, room)
     calls = _record_transfer_calls(mgr, notify_error=RuntimeError("decode unreachable"))
 
@@ -493,7 +505,7 @@ def test_last_chunk_without_aux_fails_room(
     aux_index: int | None, dst_aux_index: int
 ) -> None:
     room = 0xC0FFEE_205
-    mgr = _bare_manager(registered_aux_segments=["aux-segment"])
+    mgr = _bare_manager(_local_keys=ONE_AUX_KEYS)
     _ready_room(mgr, room, dst_aux_index=dst_aux_index)
     calls = _record_transfer_calls(mgr)
 
@@ -1349,7 +1361,7 @@ def test_transfer_failure_records_and_clears_room() -> None:
 
 def test_dummy_rank_concludes_on_last_chunk_without_transfer() -> None:
     room = 0xC0FFEE_238
-    mgr = _bare_manager(registered_aux_segments=["aux-segment"])
+    mgr = _bare_manager(_local_keys=ONE_AUX_KEYS)
     _ready_room(
         mgr,
         room,
@@ -1522,32 +1534,22 @@ def test_manager_without_binding_fails_before_opening_sockets(
         UniflowKVManager(_manager_args([], 0), DisaggregationMode.PREFILL, None)
 
 
-class _SpanSegment:
-    def span(self, offset: int, length: int) -> tuple[int, int]:
-        return offset, length
-
-
 def test_state_index_count_drift_truncates_only_paged_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    segment = _SpanSegment()
     mgr = _bare_manager(
         state_types=[StateType.SWA, StateType.MAMBA],
-        registered_state_segments=[[segment], [segment]],
         kv_args=SimpleNamespace(state_item_lens=[[8], [16]]),
-        transfer_request_cls=lambda src, dst: (src, dst),
     )
+    attach_uniflow_transport(mgr, state=[[REGION], [REGION]])
     puts: list[list[Any]] = []
 
     def put(requests: list[Any]) -> _ScriptedFuture:
-        puts.append(requests)
+        puts.append([(request.src, request.dst) for request in requests])
         return _ScriptedFuture(is_done=True)
 
-    peer = DecodePeer(
-        connection=SimpleNamespace(put=put),
-        remote_kv_segments=[],
-        remote_aux_segments=[],
-        remote_state_segments=[[segment], [segment]],
+    peer = peer_buffers(
+        SimpleNamespace(put=put), agent_id=DECODE_AGENT, state=[[REGION], [REGION]]
     )
 
     with caplog.at_level(logging.WARNING, logger=uniflow_conn.logger.name):
@@ -1576,31 +1578,32 @@ class _ScriptedFuture:
         )
 
 
-def _put_peer(put: Callable[..., Any]) -> DecodePeer:
-    return DecodePeer(
-        connection=SimpleNamespace(put=put),
-        remote_kv_segments=[],
-        remote_aux_segments=[],
-        remote_state_segments=[],
-    )
+def _put_peer(put: Callable[..., Any]) -> PeerBuffers:
+    return peer_buffers(SimpleNamespace(put=put), agent_id=DECODE_AGENT, kv=[REGION])
+
+
+def _kv_copies() -> list[Copy]:
+    [key] = BufferKeys.for_buffers([REGION], [], []).kv
+    return [Copy(src=key, dst=key, ranges=copy_ranges([(0, 0, 8)]))]
 
 
 def test_put_raises_put_error_on_timeout_and_failure() -> None:
     mgr = _bare_manager(transfer_timeout_ms=5)
+    attach_uniflow_transport(mgr, kv=[REGION])
 
     timed_out = _ScriptedFuture(is_done=False)
     with pytest.raises(UniflowPutError, match="KV put timed out"):
-        mgr._put(_put_peer(lambda requests: timed_out), ["req"], "KV put")
+        mgr._put(_put_peer(lambda requests: timed_out), _kv_copies(), "KV put")
     assert timed_out.timeouts == [5]
     failed = _ScriptedFuture(is_done=True, error="link down")
     with pytest.raises(UniflowPutError, match="aux put failed: link down"):
-        mgr._put(_put_peer(lambda requests: failed), ["req"], "aux put")
+        mgr._put(_put_peer(lambda requests: failed), _kv_copies(), "aux put")
 
     def refuse(requests: list[Any]) -> None:
         raise RuntimeError("connection closed")
 
     with pytest.raises(UniflowPutError, match="state put failed: connection closed"):
-        mgr._put(_put_peer(refuse), ["req"], "state put")
+        mgr._put(_put_peer(refuse), _kv_copies(), "state put")
 
     def broken_get() -> None:
         raise RuntimeError("broken promise")
@@ -1609,10 +1612,12 @@ def test_put_raises_put_error_on_timeout_and_failure() -> None:
     # so the caller shuts the connection down.
     broken = SimpleNamespace(wait_for=lambda timeout_ms: True, get=broken_get)
     with pytest.raises(UniflowPutError, match="KV put failed: broken promise"):
-        mgr._put(_put_peer(lambda requests: broken), ["req"], "KV put")
+        mgr._put(_put_peer(lambda requests: broken), _kv_copies(), "KV put")
 
     mgr._put(
-        _put_peer(lambda requests: _ScriptedFuture(is_done=True)), ["req"], "KV put"
+        _put_peer(lambda requests: _ScriptedFuture(is_done=True)),
+        _kv_copies(),
+        "KV put",
     )
     mgr._put(_put_peer(lambda requests: pytest.fail("empty batch put")), [], "KV put")
 
@@ -1664,20 +1669,15 @@ def _pending_put_manager(
     room: int, connection: _DrainingConnection, **attrs: Any
 ) -> tuple[UniflowKVManager, list[tuple[list[bytes], bool]]]:
     """A ready room whose KV put times out; frames record whether puts had drained."""
-    segment = _SpanSegment()
     mgr = _bare_manager(
         transfer_timeout_ms=20,
-        registered_kv_segments=[segment],
         kv_args=SimpleNamespace(kv_item_lens=[8], aux_item_lens=[]),
-        transfer_request_cls=lambda src, dst: (src, dst),
         **attrs,
     )
+    attach_uniflow_transport(mgr, kv=[REGION])
     _ready_room(mgr, room)
-    mgr.decode_peers[DECODE_AGENT] = DecodePeer(
-        connection=connection,
-        remote_kv_segments=[segment],
-        remote_aux_segments=[],
-        remote_state_segments=[],
+    mgr._peers[DECODE_AGENT] = peer_buffers(
+        connection, agent_id=DECODE_AGENT, kv=[REGION]
     )
     frames: list[tuple[list[bytes], bool]] = []
 
@@ -1712,7 +1712,7 @@ def test_put_timeout_drains_connection_before_reporting_failed() -> None:
     assert is_drained
     assert mgr.request_status[room] == KVPoll.Failed
     # The next transfer to this decode reconnects.
-    assert DECODE_AGENT not in mgr.decode_peers
+    assert DECODE_AGENT not in mgr._peers
 
 
 def _decode_abort_frame(room: int) -> list[bytes]:
@@ -1810,7 +1810,7 @@ def test_failed_shutdown_after_put_failure_leaves_decode_to_its_timeouts() -> No
     assert frames == []
     assert mgr.request_status[room] == KVPoll.Failed
     assert "KV put timed out" in mgr.failure_records[room]
-    assert DECODE_AGENT not in mgr.decode_peers
+    assert DECODE_AGENT not in mgr._peers
 
 
 def test_decode_abort_during_put_with_failed_shutdown_is_not_acked() -> None:
@@ -1867,7 +1867,7 @@ def test_decode_abort_after_failed_shutdown_is_not_acked() -> None:
 
 def test_prefill_abort_during_last_put_reports_failed_to_decode() -> None:
     room = 0xC0FFEE_248
-    mgr = _bare_manager(registered_aux_segments=["aux"])
+    mgr = _bare_manager(_local_keys=ONE_AUX_KEYS)
     calls = _record_transfer_calls(mgr)
     _ready_room(mgr, room)
     sender = _bare_sender(mgr, room)
@@ -2118,95 +2118,10 @@ def bootstrap_server() -> Iterator[tuple[str, int]]:
             server.close()
 
 
-class _FakeResult:
-    def __init__(self, value: Any = None) -> None:
-        self._value = value
-
-    def has_value(self) -> bool:
-        return True
-
-    def has_error(self) -> bool:
-        return False
-
-    def value(self) -> Any:
-        return self._value
-
-
-class _FakeSegment:
-    """A segment whose export id is its host address and length."""
-
-    def __init__(
-        self,
-        ptr: int,
-        length: int,
-        memory_type: str | None = None,
-        device_id: int | None = None,
-    ) -> None:
-        self.ptr = ptr
-        self.length = length
-        self.memory_type = memory_type
-        self.device_id = device_id
-
-    def export_id(self) -> _FakeResult:
-        return _FakeResult(struct.pack("<QQ", self.ptr, self.length))
-
-    def span(self, offset: int, length: int) -> tuple[int, int]:
-        assert 0 <= offset and offset + length <= self.length
-        return self.ptr + offset, length
-
-
-class _FakeFuture:
-    def wait_for(self, timeout_ms: int) -> bool:
-        return True
-
-    def get(self) -> _FakeResult:
-        return _FakeResult()
-
-
-class _FakeConnection:
-    def shutdown(self) -> None:
-        pass
-
-    def put(self, requests: list[Any]) -> _FakeFuture:
-        for request in requests:
-            (src, src_len), (dst, dst_len) = request.src, request.dst
-            assert src_len == dst_len
-            ctypes.memmove(dst, src, src_len)
-        return _FakeFuture()
-
-
-class _FakeAgent:
-    def __init__(self, config: Any) -> None:
-        self._agent_id = f"fake-{config.name}-{id(self)}"
-
-    def get_unique_id(self) -> _FakeResult:
-        return _FakeResult(self._agent_id)
-
-    def register_segment(self, segment: _FakeSegment) -> _FakeResult:
-        return _FakeResult(segment)
-
-    def import_segment(self, export_id: bytes) -> _FakeResult:
-        return _FakeResult(_FakeSegment(*struct.unpack("<QQ", export_id)))
-
-    def connect(self, agent_id: str) -> _FakeResult:
-        return _FakeResult(_FakeConnection())
-
-    def accept(self) -> None:
-        threading.Event().wait()
-
-
 @pytest.fixture()
 def fake_uniflow(monkeypatch: pytest.MonkeyPatch) -> None:
-    core = ModuleType("uniflow._core")
-    core.MemoryType = SimpleNamespace(VRAM="VRAM", DRAM="DRAM")
-    core.Segment = _FakeSegment
-    core.TransferRequest = lambda src, dst: SimpleNamespace(src=src, dst=dst)
-    core.UniflowAgentConfig = lambda device_id, name, listen_address: SimpleNamespace(
-        name=name
-    )
-    core.UniflowAgent = _FakeAgent
     monkeypatch.setitem(sys.modules, "uniflow", ModuleType("uniflow"))
-    monkeypatch.setitem(sys.modules, "uniflow._core", core)
+    monkeypatch.setitem(sys.modules, "uniflow._core", fake_uniflow_core())
     monkeypatch.setenv("SGLANG_HOST_IP", LOCALHOST)
 
 
@@ -2296,16 +2211,16 @@ def test_cpu_segments_register_kv_and_state_in_vram_aux_in_dram(
     cpu_pd: SimpleNamespace,
 ) -> None:
     for mgr in (cpu_pd.prefill, cpu_pd.decode):
+        # The manager registers KV, then aux, then state buffers.
+        num_kv, num_aux = len(mgr._local_keys.kv), len(mgr._local_keys.aux)
+        registered = mgr.transport._agent.registered
+        assert len(registered) == num_kv + num_aux + 1
         placements = [
             {(seg.memory_type, seg.device_id) for seg in segments}
             for segments in (
-                mgr.registered_kv_segments,
-                [
-                    seg
-                    for component in mgr.registered_state_segments
-                    for seg in component
-                ],
-                mgr.registered_aux_segments,
+                registered[:num_kv],
+                registered[num_kv + num_aux :],
+                registered[num_kv : num_kv + num_aux],
             )
         ]
         assert placements == [{("VRAM", 0)}, {("VRAM", 0)}, {("DRAM", -1)}]

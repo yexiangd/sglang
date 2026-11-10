@@ -29,18 +29,21 @@ before prefill reports Failed (see DESIGN.md).
 Scope is intentionally narrow: CP=1, PP=1, DCP=1, no hisparse or custom memory
 pool, one-to-one prefill/decode rank routing (MLA dummy ranks included), and
 mamba, SWA, or DSA state.
+
+The manager is the protocol of the Transport interface (RFC #46455): it plans
+each put as Copy byte ranges over UniflowBufferKey names, and UniflowTransport
+(transport.py) owns the UniFlow agent, segments, connections and puts.
 """
 
 from __future__ import annotations
 
-import base64
 import functools
 import json
 import logging
 import queue
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -68,6 +71,18 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.transport.base import Copy, Status
+from sglang.srt.disaggregation.uniflow.buffers import (
+    BufferKeys,
+    BufferKind,
+    copy_ranges,
+    group_units,
+)
+from sglang.srt.disaggregation.uniflow.transport import (
+    UniflowRemoteBuffers,
+    UniflowTransport,
+    import_uniflow_core,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -81,10 +96,6 @@ METADATA_MSG = b"metadata"
 ABORT_MSG = b"abort"
 # METADATA aux index of a request without aux data.
 NO_AUX_INDEX = -1
-# One per prefill connection, reconnects after a failed put included. Decode
-# cannot tell a dead connection from a live one, so past the bound the oldest
-# is dropped, which closes it.
-MAX_ACCEPTED_CONNECTIONS = 1024
 # A late abort for a cleared room is never consumed, so the oldest are evicted.
 MAX_PENDING_ABORTS = 4096
 DEFAULT_ABORT_REASON = "UniFlow request aborted"
@@ -95,21 +106,6 @@ TRUNCATABLE_STATE_TYPES = frozenset({StateType.SWA, StateType.DSA})
 
 class UniflowPutError(RuntimeError):
     """A put() that failed or timed out; its writes may still be in flight."""
-
-
-def _uniflow_value(result: Any, action: str) -> Any:
-    if not result.has_value():
-        error = result.error() if result.has_error() else "no value"
-        raise RuntimeError(f"UniFlow {action} failed: {error}")
-    return result.value()
-
-
-def _encode_export_id(export_id: bytes) -> str:
-    return base64.b64encode(export_id).decode("ascii")
-
-
-def _decode_export_id(export_id: str) -> bytes:
-    return base64.b64decode(export_id.encode("ascii"))
 
 
 def _flatten_component_indices(component: Any) -> list[int]:
@@ -186,11 +182,12 @@ class TransferInfo(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-class DecodePeer(msgspec.Struct, frozen=True, kw_only=True):
-    connection: Any
-    remote_kv_segments: list[Any]
-    remote_aux_segments: list[Any]
-    remote_state_segments: list[list[Any]]
+class PeerBuffers(msgspec.Struct, frozen=True):
+    """A decode peer as imported from its REGISTER: the transport's handle and
+    the keys of its buffers."""
+
+    remote: UniflowRemoteBuffers
+    keys: BufferKeys
 
 
 class UniflowKVManager(CommonKVManager):
@@ -255,48 +252,28 @@ class UniflowKVManager(CommonKVManager):
                 f"components={len(args.state_data_ptrs or [])}"
             )
 
-        try:
-            from uniflow._core import (
-                MemoryType,
-                Segment,
-                TransferRequest,
-                UniflowAgent,
-                UniflowAgentConfig,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "--disaggregation-transfer-backend uniflow requires the uniflow "
-                "package with its compiled _core extension; importing "
-                f"uniflow._core failed: {e}"
-            ) from e
+        # Fails before CommonKVManager.__init__ opens any socket or thread.
+        uniflow_core = import_uniflow_core()
 
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
-        self.memory_type_enum = MemoryType
-        self.segment_cls = Segment
-        self.transfer_request_cls = TransferRequest
-
-        config = UniflowAgentConfig(
+        self.transport = UniflowTransport.create(
+            uniflow_core,
             device_id=self.kv_args.gpu_id,
             name=f"sglang_uniflow_{disaggregation_mode.value}_{self.kv_args.engine_rank}",
-            # UniFlow splits host:port on the last colon and rejects brackets,
-            # so an IPv6 host stays unbracketed.
-            listen_address=f"{self.local_ip}:0",
+            host=self.local_ip,
         )
-        self.agent = UniflowAgent(config)
-        self.agent_id = _uniflow_value(self.agent.get_unique_id(), "get unique id")
-
-        self.registered_kv_segments: list[Any] = []
-        self.registered_aux_segments: list[Any] = []
-        self.registered_state_segments: list[list[Any]] = []
-        self.kv_export_ids: list[str] = []
-        self.aux_export_ids: list[str] = []
-        self.state_export_ids: list[list[str]] = []
+        self.agent_id = self.transport.agent_id
+        self._local_keys = BufferKeys.for_buffers(
+            self.kv_args.kv_data_ptrs,
+            self.kv_args.aux_data_ptrs,
+            self.kv_args.state_data_ptrs or [],
+        )
         # Keyed by decode agent_id. A peer is dropped after a failed put and
         # reconnected on next use; peers of departed decode instances are not
         # reclaimed.
         self.decode_peer_infos: dict[str, DecodePeerInfo] = {}
-        self.decode_peers: dict[str, DecodePeer] = {}
+        self._peers: dict[str, PeerBuffers] = {}
         self.decode_peers_lock = threading.Lock()
         # Re-entrant (the default RLock) so helpers called under it can
         # re-acquire it.
@@ -305,8 +282,6 @@ class UniflowKVManager(CommonKVManager):
         # __init__ consumes early ones; ones arriving after clear() age out.
         self.pending_aborts: OrderedDict[int, str] = OrderedDict()
         self.transfer_timeout_ms = transfer_timeout_ms
-        self._accepted_connections: deque[Any] = deque(maxlen=MAX_ACCEPTED_CONNECTIONS)
-        self._accepted_connections_lock = threading.Lock()
         # Prefill puts run on one FIFO worker so the scheduler never blocks on
         # completion. One worker keeps per-room chunk order, confines
         # Connection use to a single thread, and runs an ABORT_ACK only after
@@ -316,8 +291,8 @@ class UniflowKVManager(CommonKVManager):
             # One-to-one routing gives each prefill rank one decode destination.
             self._kv_replica_factor = 1
 
-        self._register_segments()
-        self._start_accept_thread()
+        self._register_buffers()
+        self.transport.start_accepting()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_transfer_worker()
@@ -328,19 +303,7 @@ class UniflowKVManager(CommonKVManager):
             # answering /health, as the other backends do.
             self._start_heartbeat_checker_thread()
 
-    def _register_segment(
-        self, ptr: int, length: int, memory_type: Any, device_id: int, kind: str
-    ) -> tuple[Any, str]:
-        registered = _uniflow_value(
-            self.agent.register_segment(
-                self.segment_cls(ptr, length, memory_type, device_id)
-            ),
-            f"register {kind} segment",
-        )
-        export_id = _uniflow_value(registered.export_id(), f"export {kind} segment")
-        return registered, _encode_export_id(export_id)
-
-    def _register_segments(self) -> None:
+    def _register_buffers(self) -> None:
         # No unwind on failure: a raise here aborts startup, and process exit
         # releases the registrations.
         if len(self.kv_args.kv_data_ptrs) != len(self.kv_args.kv_data_lens):
@@ -349,31 +312,12 @@ class UniflowKVManager(CommonKVManager):
                 f"ptrs={len(self.kv_args.kv_data_ptrs)} "
                 f"lens={len(self.kv_args.kv_data_lens)}"
             )
-        for ptr, length in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens, strict=True
-        ):
-            registered, export_id = self._register_segment(
-                ptr, length, self.memory_type_enum.VRAM, self.kv_args.gpu_id, "KV"
-            )
-            self.registered_kv_segments.append(registered)
-            self.kv_export_ids.append(export_id)
-
         if len(self.kv_args.aux_data_ptrs) != len(self.kv_args.aux_data_lens):
             raise ValueError(
                 "UniFlow aux data ptr/len count mismatch: "
                 f"ptrs={len(self.kv_args.aux_data_ptrs)} "
                 f"lens={len(self.kv_args.aux_data_lens)}"
             )
-        for ptr, length in zip(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens, strict=True
-        ):
-            # Aux buffers are host memory; -1 is the UniFlow device id for DRAM.
-            registered, export_id = self._register_segment(
-                ptr, length, self.memory_type_enum.DRAM, -1, "aux"
-            )
-            self.registered_aux_segments.append(registered)
-            self.aux_export_ids.append(export_id)
-
         state_data_ptrs = self.kv_args.state_data_ptrs or []
         state_data_lens = self.kv_args.state_data_lens or []
         if len(state_data_ptrs) != len(state_data_lens):
@@ -387,48 +331,22 @@ class UniflowKVManager(CommonKVManager):
                     "UniFlow state data ptr/len mismatch within component: "
                     f"ptrs={len(ptrs)} lens={len(lens)}"
                 )
-            component_segments = []
-            component_export_ids = []
-            for ptr, length in zip(ptrs, lens, strict=True):
-                registered, export_id = self._register_segment(
-                    ptr,
-                    length,
-                    self.memory_type_enum.VRAM,
-                    self.kv_args.gpu_id,
-                    "state",
-                )
-                component_segments.append(registered)
-                component_export_ids.append(export_id)
-            self.registered_state_segments.append(component_segments)
-            self.state_export_ids.append(component_export_ids)
-
-    def _start_accept_thread(self) -> None:
-        def accept_loop() -> None:
-            last_error: str | None = None
-            while True:
-                try:
-                    result = self.agent.accept()
-                    if result.has_error():
-                        # Warn once per distinct error; a broken listener
-                        # repeats the same one every retry.
-                        error = str(result.error())
-                        level = (
-                            logging.DEBUG if error == last_error else logging.WARNING
-                        )
-                        logger.log(level, "UniFlow accept failed: %s", error)
-                        last_error = error
-                        time.sleep(0.1)
-                        continue
-                    last_error = None
-                    # Keep accepted UniFlow connections alive, but bound retention.
-                    with self._accepted_connections_lock:
-                        self._accepted_connections.append(result.value())
-                except Exception:
-                    # Keep the accept thread alive across unexpected errors.
-                    logger.exception("UniFlow accept loop iteration failed")
-                    time.sleep(0.1)
-
-        threading.Thread(target=accept_loop, daemon=True).start()
+        lengths = dict(
+            self._local_keys.pair(
+                self.kv_args.kv_data_lens, self.kv_args.aux_data_lens, state_data_lens
+            )
+        )
+        for key, ptr in self._local_keys.pair(
+            self.kv_args.kv_data_ptrs, self.kv_args.aux_data_ptrs, state_data_ptrs
+        ):
+            # Aux buffers are host memory, which UniFlow registers as DRAM.
+            device = -1 if key.kind == BufferKind.AUX else self.kv_args.gpu_id
+            self.transport.register(key, ptr, lengths[key], device)
+        self.kv_export_ids = self.transport.export_ids(self._local_keys.kv)
+        self.aux_export_ids = self.transport.export_ids(self._local_keys.aux)
+        self.state_export_ids = [
+            self.transport.export_ids(keys) for keys in self._local_keys.state
+        ]
 
     def _handle_prefill_message(self, msg: list[bytes]) -> None:
         if not msg or msg[0] != GUARD:
@@ -597,66 +515,52 @@ class UniflowKVManager(CommonKVManager):
             ),
         ]
 
-    def _get_or_connect_decode_peer(self, peer_info: DecodePeerInfo) -> DecodePeer:
+    def _get_or_connect_decode_peer(self, peer_info: DecodePeerInfo) -> PeerBuffers:
         with self.decode_peers_lock:
-            cached = self.decode_peers.get(peer_info.agent_id)
+            cached = self._peers.get(peer_info.agent_id)
             if cached is not None:
                 return cached
 
-            if len(peer_info.kv_export_ids) != len(self.registered_kv_segments):
+            local = self._local_keys
+            if len(peer_info.kv_export_ids) != len(local.kv):
                 raise ValueError(
                     "UniFlow KV segment count mismatch: "
-                    f"local={len(self.registered_kv_segments)} "
+                    f"local={len(local.kv)} "
                     f"remote={len(peer_info.kv_export_ids)}"
                 )
-            if len(peer_info.aux_export_ids) != len(self.registered_aux_segments):
+            if len(peer_info.aux_export_ids) != len(local.aux):
                 raise ValueError(
                     "UniFlow aux segment count mismatch: "
-                    f"local={len(self.registered_aux_segments)} "
+                    f"local={len(local.aux)} "
                     f"remote={len(peer_info.aux_export_ids)}"
                 )
-            if len(peer_info.state_export_ids) != len(self.registered_state_segments):
+            if len(peer_info.state_export_ids) != len(local.state):
                 raise ValueError(
                     "UniFlow state component count mismatch: "
-                    f"local={len(self.registered_state_segments)} "
+                    f"local={len(local.state)} "
                     f"remote={len(peer_info.state_export_ids)}"
                 )
-
-            remote_state_segments = []
             for local_component, remote_export_ids in zip(
-                self.registered_state_segments, peer_info.state_export_ids, strict=True
+                local.state, peer_info.state_export_ids, strict=True
             ):
                 if len(local_component) != len(remote_export_ids):
                     raise ValueError(
                         "UniFlow state segment count mismatch within component: "
                         f"local={len(local_component)} remote={len(remote_export_ids)}"
                     )
-                remote_state_segments.append(
-                    self._import_segments(remote_export_ids, "state")
-                )
 
-            connection = _uniflow_value(
-                self.agent.connect(peer_info.agent_id), "connect decode peer"
+            export_ids = (
+                peer_info.kv_export_ids,
+                peer_info.aux_export_ids,
+                peer_info.state_export_ids,
             )
-            peer = DecodePeer(
-                connection=connection,
-                remote_kv_segments=self._import_segments(peer_info.kv_export_ids, "KV"),
-                remote_aux_segments=self._import_segments(
-                    peer_info.aux_export_ids, "aux"
-                ),
-                remote_state_segments=remote_state_segments,
+            keys = BufferKeys.for_buffers(*export_ids)
+            remote = self.transport.import_registration(
+                agent_id=peer_info.agent_id, export_ids=dict(keys.pair(*export_ids))
             )
-            self.decode_peers[peer_info.agent_id] = peer
+            peer = PeerBuffers(remote=remote, keys=keys)
+            self._peers[peer_info.agent_id] = peer
             return peer
-
-    def _import_segments(self, export_ids: list[str], kind: str) -> list[Any]:
-        return [
-            _uniflow_value(
-                self.agent.import_segment(_decode_export_id(export_id)),
-                f"import {kind} segment",
-            )
-            for export_id in export_ids
-        ]
 
     def wait_for_transfer_info(self, room: int) -> tuple[TransferInfo, DecodePeerInfo]:
         with self.condition:
@@ -758,11 +662,11 @@ class UniflowKVManager(CommonKVManager):
         still complete. The next transfer reconnects.
         """
         with self.decode_peers_lock:
-            peer = self.decode_peers.pop(agent_id, None)
+            peer = self._peers.pop(agent_id, None)
         if peer is None:
             return True
         try:
-            peer.connection.shutdown()
+            self.transport.disconnect(peer.remote)
         except Exception:
             logger.exception("UniFlow shutdown of decode peer %s failed", agent_id)
             return False
@@ -875,7 +779,7 @@ class UniflowKVManager(CommonKVManager):
             if is_last:
                 # A room stopped during an earlier put gets no further writes;
                 # mark_transfer_success still reports a Failed room to decode.
-                if self.registered_aux_segments:
+                if self._local_keys.aux:
                     if aux_index is None or info.dst_aux_index == NO_AUX_INDEX:
                         raise ValueError("UniFlow last chunk requires aux_index")
                     if not self._is_room_stopped(room):
@@ -905,47 +809,44 @@ class UniflowKVManager(CommonKVManager):
 
     def _put_kv(
         self,
-        peer: DecodePeer,
+        peer: PeerBuffers,
         src_indices: npt.NDArray[np.int32],
         dst_indices: npt.NDArray[np.int32],
     ) -> None:
-        src_blocks, dst_blocks = group_concurrent_contiguous(src_indices, dst_indices)
-        requests = []
-        for local_segment, remote_segment, item_len in zip(
-            self.registered_kv_segments,
-            peer.remote_kv_segments,
-            self.kv_args.kv_item_lens,
-            strict=True,
-        ):
-            for src_block, dst_block in zip(src_blocks, dst_blocks, strict=True):
-                length = int(item_len) * len(src_block)
-                requests.append(
-                    self.transfer_request_cls(
-                        local_segment.span(int(src_block[0]) * item_len, length),
-                        remote_segment.span(int(dst_block[0]) * item_len, length),
-                    )
-                )
-        self._put(peer, requests, "KV put")
-
-    def _put_aux(self, peer: DecodePeer, src_index: int, dst_index: int) -> None:
-        requests = []
-        for local_segment, remote_segment, item_len in zip(
-            self.registered_aux_segments,
-            peer.remote_aux_segments,
-            self.kv_args.aux_item_lens,
-            strict=True,
-        ):
-            requests.append(
-                self.transfer_request_cls(
-                    local_segment.span(src_index * item_len, item_len),
-                    remote_segment.span(dst_index * item_len, item_len),
-                )
+        # One run of pages contiguous on both sides is one range per KV buffer.
+        units = group_units(*group_concurrent_contiguous(src_indices, dst_indices))
+        copies = [
+            Copy(src=src, dst=dst, ranges=units * np.uint64(item_len))
+            for src, dst, item_len in zip(
+                self._local_keys.kv,
+                peer.keys.kv,
+                self.kv_args.kv_item_lens,
+                strict=True,
             )
-        self._put(peer, requests, "aux put")
+        ]
+        self._put(peer, copies, "KV put")
+
+    def _put_aux(self, peer: PeerBuffers, src_index: int, dst_index: int) -> None:
+        copies = [
+            Copy(
+                src=src,
+                dst=dst,
+                ranges=copy_ranges(
+                    [(src_index * item_len, dst_index * item_len, item_len)]
+                ),
+            )
+            for src, dst, item_len in zip(
+                self._local_keys.aux,
+                peer.keys.aux,
+                self.kv_args.aux_item_lens,
+                strict=True,
+            )
+        ]
+        self._put(peer, copies, "aux put")
 
     def _put_state(
         self,
-        peer: DecodePeer,
+        peer: PeerBuffers,
         src_state_indices: list | None,
         dst_state_indices: list[list[int]],
     ) -> None:
@@ -958,7 +859,7 @@ class UniflowKVManager(CommonKVManager):
                 f"source={len(src_components)} destination={len(dst_state_indices)}"
             )
 
-        requests = []
+        copies = []
         for component_id, (src_indices, dst_indices) in enumerate(
             zip(src_components, dst_state_indices, strict=True)
         ):
@@ -977,41 +878,42 @@ class UniflowKVManager(CommonKVManager):
                     len(src_indices),
                     len(dst_indices),
                 )
-            for local_segment, remote_segment, item_len in zip(
-                self.registered_state_segments[component_id],
-                peer.remote_state_segments[component_id],
+            pairs = list(zip(src_indices[:count], dst_indices[:count], strict=True))
+            for src, dst, item_len in zip(
+                self._local_keys.state[component_id],
+                peer.keys.state[component_id],
                 self.kv_args.state_item_lens[component_id],
                 strict=True,
             ):
-                for src_index, dst_index in zip(
-                    src_indices[:count], dst_indices[:count], strict=True
-                ):
-                    requests.append(
-                        self.transfer_request_cls(
-                            local_segment.span(src_index * item_len, item_len),
-                            remote_segment.span(dst_index * item_len, item_len),
-                        )
+                if item_len == 0:
+                    # An elided DSA index-K entry is never registered and moves
+                    # nothing, as in the other backends.
+                    continue
+                copies.append(
+                    Copy(
+                        src=src,
+                        dst=dst,
+                        ranges=copy_ranges(
+                            (s * item_len, d * item_len, item_len) for s, d in pairs
+                        ),
                     )
-        self._put(peer, requests, "state put")
+                )
+        self._put(peer, copies, "state put")
 
-    def _put(self, peer: DecodePeer, requests: list[Any], action: str) -> None:
+    def _put(self, peer: PeerBuffers, copies: list[Copy], action: str) -> None:
         # Returns only after the batch completes, so a later raise leaves no
-        # write in flight.
-        if not requests:
+        # write in flight. Each call is one put batch, so device KV never
+        # shares a batch with host aux and keeps the GPU peer tier.
+        handles = self.transport.write_all(peer.remote, copies)
+        if not handles:
             return
-        try:
-            future = peer.connection.put(requests=requests)
-            if not future.wait_for(timeout_ms=self.transfer_timeout_ms):
-                raise UniflowPutError(f"UniFlow {action} timed out")
-            result = future.get()
-            if result.has_error():
-                raise UniflowPutError(f"UniFlow {action} failed: {result.error()}")
-        except UniflowPutError:
-            raise
-        except Exception as e:
+        result = self.transport.wait_all(handles, timeout_ms=self.transfer_timeout_ms)
+        if result.status is Status.PENDING:
+            raise UniflowPutError(f"UniFlow {action} timed out")
+        if result.status is Status.FAILED:
             # A binding error may leave the batch on the wire;
             # the caller shuts the connection down.
-            raise UniflowPutError(f"UniFlow {action} failed: {e}") from e
+            raise UniflowPutError(f"UniFlow {action} failed: {result.reason}")
 
 
 class UniflowKVSender(CommonKVSender):
