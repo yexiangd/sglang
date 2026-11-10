@@ -210,6 +210,8 @@ exports an empty id, and moves nothing, as in the other backends.
 - `test/registered/unit/disaggregation/test_uniflow_backend.py`: CPU tests of
   the connector over a real `UniflowTransport` and a fake `uniflow._core`
   (`python/sglang/test/uniflow_utils.py`).
+- `test/registered/unit/disaggregation/test_uniflow_transport.py`: CPU tests of
+  `UniflowTransport` alone over the same fake binding.
 - `test/registered/amd/disaggregation/test_uniflow_transfer_engine_gpu.py`: KV,
   aux, and state transfer between two GPUs on the real binding.
 - `test/registered/amd/disaggregation/test_uniflow_transfer_engine_e2e.py`:
