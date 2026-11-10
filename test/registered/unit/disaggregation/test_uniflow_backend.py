@@ -1622,6 +1622,77 @@ def test_put_raises_put_error_on_timeout_and_failure() -> None:
     mgr._put(_put_peer(lambda requests: pytest.fail("empty batch put")), [], "KV put")
 
 
+def test_last_chunk_puts_kv_aux_and_state_as_separate_batches() -> None:
+    # UniFlow picks one tier per put batch, so device KV must not share a
+    # batch with host aux, or it loses the intra-host GPU peer tier.
+    room = 0xC0FFEE_251
+    mgr = _bare_manager(
+        state_types=[StateType.MAMBA],
+        kv_args=SimpleNamespace(
+            kv_item_lens=[8], aux_item_lens=[4], state_item_lens=[[16]]
+        ),
+    )
+    attach_uniflow_transport(mgr, kv=[REGION], aux=[REGION], state=[[REGION]])
+    _ready_room(mgr, room, dst_state_indices=[[3]])
+    batches: list[list[Any]] = []
+
+    def put(requests: list[Any]) -> _ScriptedFuture:
+        batches.append([(request.src, request.dst) for request in requests])
+        return _ScriptedFuture(is_done=True)
+
+    mgr._peers[DECODE_AGENT] = peer_buffers(
+        SimpleNamespace(put=put),
+        agent_id=DECODE_AGENT,
+        kv=[REGION],
+        aux=[REGION],
+        state=[[REGION]],
+    )
+    mgr._send_multipart_locked = lambda endpoint, parts, is_ipv6=False: None
+
+    mgr._do_transfer_request(
+        room,
+        np.array([0, 1, 2], dtype=np.int32),
+        index_slice=slice(0, 3),
+        is_last=True,
+        aux_index=2,
+        state_indices=[[1]],
+        wait_event=None,
+    )
+
+    assert batches == [
+        # Pages 0-2 to the decode's 4-6: one run of 3 pages of 8 bytes.
+        [((0, 24), (32, 24))],
+        # Aux slot 2 to the decode's slot 1.
+        [((8, 4), (4, 4))],
+        # Mamba slot 1 to the decode's slot 3.
+        [((16, 16), (48, 16))],
+    ]
+    assert mgr.request_status[room] == KVPoll.Success
+
+
+def test_elided_state_entry_is_neither_registered_nor_written() -> None:
+    # An elided DSA index-K layer keeps a zero-length buffer for alignment.
+    mgr = _bare_manager(
+        state_types=[StateType.DSA],
+        kv_args=SimpleNamespace(state_item_lens=[[16, 0]]),
+    )
+    transport = attach_uniflow_transport(mgr, state=[[REGION, (0, 0)]])
+    assert transport.export_ids(mgr._local_keys.state[0])[1] == ""
+    batches: list[list[Any]] = []
+
+    def put(requests: list[Any]) -> _ScriptedFuture:
+        batches.append([(request.src, request.dst) for request in requests])
+        return _ScriptedFuture(is_done=True)
+
+    peer = peer_buffers(
+        SimpleNamespace(put=put), agent_id=DECODE_AGENT, state=[[REGION, (0, 0)]]
+    )
+
+    mgr._put_state(peer, [[1]], [[3]])
+
+    assert batches == [[((16, 16), (48, 16))]]
+
+
 class _PendingFuture:
     """A put still on the wire: it completes only when its connection shuts down."""
 
