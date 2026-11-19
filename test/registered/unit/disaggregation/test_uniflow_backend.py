@@ -37,7 +37,12 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    KVTransferError,
+)
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.uniflow import conn as uniflow_conn
 from sglang.srt.disaggregation.uniflow.conn import (
     ABORT_MSG,
@@ -48,7 +53,6 @@ from sglang.srt.disaggregation.uniflow.conn import (
     REGISTER_MSG,
     DecodePeer,
     DecodePeerInfo,
-    KVTransferError,
     TransferInfo,
     UniflowKVBootstrapServer,
     UniflowKVManager,
@@ -58,7 +62,6 @@ from sglang.srt.disaggregation.uniflow.conn import (
     flatten_optional_indices,
 )
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     KVClassType,
     TransferBackend,
     get_kv_class,

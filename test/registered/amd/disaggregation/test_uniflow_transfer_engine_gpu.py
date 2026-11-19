@@ -26,14 +26,14 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.common.conn import KVTransferError
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.uniflow.conn import (
-    KVTransferError,
     UniflowKVBootstrapServer,
     UniflowKVManager,
     UniflowKVReceiver,
     UniflowKVSender,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci
